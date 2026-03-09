@@ -63,7 +63,9 @@ option(VESIN_ENABLE_NVTX "Enable NVTX profiling markers" OFF)
 set(VESIN_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vesin.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu_cell_list.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cluster_pair_search.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vesin_cuda.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/verlet.cpp
 )
 
 # create two targets: `vesin` is the main one, while `vesin_objects` will
@@ -151,6 +153,10 @@ endif()
 if (VESIN_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+
+    # Build examples alongside tests
+    add_executable(verlet_example examples/verlet_example.cpp)
+    target_link_libraries(verlet_example vesin)
 endif()
 
 #------------------------------------------------------------------------------#

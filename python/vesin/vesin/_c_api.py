@@ -59,3 +59,30 @@ def setup_functions(lib):
         POINTER(ctypes.c_char_p),  # error_message
     ]
     lib.vesin_neighbors.restype = ctypes.c_int
+
+    # Verlet API
+    lib.vesin_verlet_new.argtypes = [
+        ctypes.c_double,  # cutoff
+        ctypes.c_double,  # skin
+        ctypes.c_bool,  # full_list
+        POINTER(ctypes.c_char_p),  # error_message
+    ]
+    lib.vesin_verlet_new.restype = ctypes.c_void_p
+
+    lib.vesin_verlet_free.argtypes = [ctypes.c_void_p]
+    lib.vesin_verlet_free.restype = None
+
+    lib.vesin_verlet_compute.argtypes = [
+        ctypes.c_void_p,  # vl handle
+        POINTER(ctypes.c_double),  # points
+        ctypes.c_size_t,  # n_points
+        POINTER(ctypes.c_double),  # box
+        POINTER(ctypes.c_bool),  # periodic
+        VesinOptions,  # options
+        POINTER(VesinNeighborList),  # neighbors
+        POINTER(ctypes.c_char_p),  # error_message
+    ]
+    lib.vesin_verlet_compute.restype = ctypes.c_int
+
+    lib.vesin_verlet_did_rebuild.argtypes = [ctypes.c_void_p]
+    lib.vesin_verlet_did_rebuild.restype = ctypes.c_bool

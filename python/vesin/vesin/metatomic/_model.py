@@ -9,6 +9,7 @@ from metatomic.torch import (
 )
 
 from ._neighbors import NeighborList
+from ._verlet import VerletNeighborList
 
 
 def compute_requested_neighbors(
@@ -133,6 +134,83 @@ def compute_requested_neighbors_from_options(
             system_length_unit,
             check_consistency=check_consistency,
         )
+
+        for system in systems:
+            neighbors = calculator.compute(system)
+            system.add_neighbor_list(option, neighbors)
+
+
+def compute_requested_neighbors_with_skin(
+    systems: Union[List[System], System],
+    system_length_unit: str,
+    model: Union[AtomisticModel, ModelInterface],
+    skin: float,
+    model_length_unit: Optional[str] = None,
+    check_consistency: bool = False,
+    verlet_cache: Optional[dict] = None,
+):
+    """
+    Compute all neighbors lists required by ``model``, using Verlet caching with
+    the given ``skin``.
+
+    For options with ``strict=True``, falls back to stateless computation (skin
+    is incompatible with strict mode).
+
+    :param systems: single system or list of systems
+    :param system_length_unit: unit of length used by the data in ``systems``
+    :param model: model to query for neighbor list requirements
+    :param skin: extra distance added to cutoff for the spatial search buffer
+    :param model_length_unit: unit of length used by the model (required when not
+        using AtomisticModel)
+    :param check_consistency: whether to run additional checks
+    :param verlet_cache: optional dict to persist VerletNeighborList objects across
+        calls (keyed by NeighborListOptions). Pass a dict that persists across
+        MD steps to enable caching.
+    """
+    if isinstance(model, AtomisticModel):
+        if model_length_unit is not None:
+            if model.capabilities().length_unit != model_length_unit:
+                raise ValueError(
+                    f"the given `model_length_unit` ({model_length_unit}) does not "
+                    f"match the model capabilities ({model.capabilities().length_unit})"
+                )
+        all_options = model.requested_neighbor_lists()
+    elif isinstance(model, torch.nn.Module):
+        if model_length_unit is None:
+            raise ValueError(
+                "`model_length_unit` parameter is required when not "
+                "using AtomisticModel"
+            )
+        all_options = []
+        _get_requested_neighbor_lists(
+            model, model.__class__.__name__, all_options, model_length_unit
+        )
+
+    if not isinstance(systems, list):
+        systems = [systems]
+
+    if verlet_cache is None:
+        verlet_cache = {}
+
+    for option in all_options:
+        if skin > 0 and not option.strict:
+            # Use Verlet caching
+            cache_key = id(option)
+            if cache_key not in verlet_cache:
+                verlet_cache[cache_key] = VerletNeighborList(
+                    option,
+                    system_length_unit,
+                    skin=skin,
+                    check_consistency=check_consistency,
+                )
+            calculator = verlet_cache[cache_key]
+        else:
+            # Stateless (strict=True or skin=0)
+            calculator = NeighborList(
+                option,
+                system_length_unit,
+                check_consistency=check_consistency,
+            )
 
         for system in systems:
             neighbors = calculator.compute(system)

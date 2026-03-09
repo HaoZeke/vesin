@@ -188,6 +188,70 @@ int VESIN_API vesin_neighbors(
     const char** error_message
 );
 
+/* ========================================================================== */
+/* Verlet neighbor list (stateful, displacement-based caching)                */
+/* ========================================================================== */
+
+/// Opaque handle for a Verlet neighbor list. Maintains internal state to
+/// cache pair topology and avoid redundant spatial searches when atoms
+/// have not moved significantly.
+typedef struct VesinVerletList VesinVerletList;
+
+/// Create a new Verlet neighbor list handle.
+///
+/// The Verlet list caches the topology from a full spatial search done with
+/// cutoff + skin, and reuses it until any atom displaces by more than skin/2.
+///
+/// @param cutoff Model cutoff (without skin). Pairs within this distance are
+///     returned in the output.
+/// @param skin Extra distance added to cutoff for the spatial search buffer.
+///     Must be > 0.
+/// @param full_list Whether to produce a full (both i->j and j->i) or half
+///     neighbor list.
+/// @param error_message Set to an error string on failure.
+/// @returns Pointer to a new VesinVerletList, or NULL on error.
+VESIN_API VesinVerletList* vesin_verlet_new(
+    double cutoff,
+    double skin,
+    bool full_list,
+    const char** error_message
+);
+
+/// Free a Verlet neighbor list handle and all associated memory.
+void VESIN_API vesin_verlet_free(VesinVerletList* vl);
+
+/// Compute (or reuse cached) neighbor list.
+///
+/// On the first call, or when atoms have moved beyond the skin threshold,
+/// a full spatial search is performed and cached. Otherwise, the cached
+/// topology is reused and only distance vectors are recomputed.
+///
+/// @param vl Verlet list handle from vesin_verlet_new().
+/// @param points Positions of all points, shape [n_points][3].
+/// @param n_points Number of points.
+/// @param box 3x3 bounding box matrix (row-major).
+/// @param periodic Array of 3 bools for periodic boundary conditions.
+/// @param options Output options (return_shifts, return_distances,
+///     return_vectors, sorted). The cutoff and full fields in options are
+///     ignored (they come from the VesinVerletList handle).
+/// @param neighbors Caller-owned VesinNeighborList for output.
+/// @param error_message Set to error string on failure.
+/// @returns 0 on success, non-zero on error.
+int VESIN_API vesin_verlet_compute(
+    VesinVerletList* vl,
+    const double (*points)[3],
+    size_t n_points,
+    const double box[3][3],
+    const bool periodic[3],
+    struct VesinOptions options,
+    struct VesinNeighborList* neighbors,
+    const char** error_message
+);
+
+/// Query whether the last vesin_verlet_compute() call performed a full
+/// rebuild (true) or reused the cache (false).
+bool VESIN_API vesin_verlet_did_rebuild(const VesinVerletList* vl);
+
 #ifdef __cplusplus
 
 } // extern "C"
