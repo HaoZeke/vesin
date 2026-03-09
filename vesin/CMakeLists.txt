@@ -80,6 +80,7 @@ target_include_directories(vesin_objects PUBLIC
 # Generate the CUDA source files for NVRTC compilation
 make_includeable(${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_bruteforce.cu ${CMAKE_CURRENT_BINARY_DIR}/generated/cuda_bruteforce.cu)
 make_includeable(${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_cell_list.cu ${CMAKE_CURRENT_BINARY_DIR}/generated/cuda_cell_list.cu)
+make_includeable(${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_cluster_pair.cu ${CMAKE_CURRENT_BINARY_DIR}/generated/cuda_cluster_pair.cu)
 
 include(FetchContent)
 

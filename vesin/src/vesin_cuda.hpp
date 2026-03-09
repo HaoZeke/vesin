@@ -57,6 +57,17 @@ struct CudaNeighborListExtras {
     double* box_diag = nullptr;      // [3] diagonal elements for orthogonal boxes
     double* inv_box_brute = nullptr; // [9] inverse box matrix for general boxes
 
+    // Cluster-pair GPU buffers (allocated on demand)
+    struct ClusterPairBuffers {
+        size_t max_clusters = 0;
+        size_t max_cells = 0;
+        int32_t* cluster_atom_indices = nullptr; // [max_clusters * CLUSTER_SIZE_GPU]
+        int32_t* cluster_n_atoms = nullptr;      // [max_clusters]
+        float* cluster_bb_lower = nullptr;       // [max_clusters * 3]
+        float* cluster_bb_upper = nullptr;       // [max_clusters * 3]
+        int32_t* cell_offsets = nullptr;          // [max_cells + 1]
+    } cluster_pair;
+
     ~CudaNeighborListExtras();
 };
 
