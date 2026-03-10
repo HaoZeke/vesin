@@ -1,3 +1,4 @@
+#include <cstring>
 #include <sstream>
 
 #include <torch/torch.h>
@@ -28,54 +29,16 @@ static torch::Device vesin_to_torch_device(VesinDevice device) {
     }
 }
 
-/// Custom autograd function that only registers a custom backward corresponding
-/// to the neighbors list calculation
-class AutogradNeighbors: public torch::autograd::Function<AutogradNeighbors> {
-public:
-    static std::vector<torch::Tensor> forward(
-        torch::autograd::AutogradContext* ctx,
-        torch::Tensor points,
-        torch::Tensor box,
-        torch::Tensor periodic,
-        torch::Tensor pairs,
-        torch::optional<torch::Tensor> shifts,
-        torch::optional<torch::Tensor> distances,
-        torch::optional<torch::Tensor> vectors
-    );
+// ========================================================================== //
+// Shared helpers for input validation and output wrapping                     //
+// ========================================================================== //
 
-    static std::vector<torch::Tensor> backward(
-        torch::autograd::AutogradContext* ctx,
-        std::vector<torch::Tensor> outputs_grad
-    );
-};
-
-NeighborListHolder::NeighborListHolder(
-    double cutoff,
-    bool full_list,
-    bool sorted,
-    std::string algorithm
-):
-    cutoff_(cutoff),
-    full_list_(full_list),
-    sorted_(sorted),
-    algorithm_(std::move(algorithm)),
-    data_(nullptr) {
-    data_ = new VesinNeighborList();
-}
-
-NeighborListHolder::~NeighborListHolder() {
-    vesin_free(data_);
-    delete data_;
-}
-
-std::vector<torch::Tensor> NeighborListHolder::compute(
-    torch::Tensor points,
-    torch::Tensor box,
-    torch::Tensor periodic,
-    std::string quantities,
-    bool copy
+/// Validate and normalize inputs. Returns the vesin device.
+static VesinDevice validate_inputs(
+    torch::Tensor& points,
+    torch::Tensor& box,
+    torch::Tensor& periodic
 ) {
-    // check input data
     if (points.device() != box.device()) {
         // clang-format off
         C10_THROW_ERROR(ValueError,
@@ -107,7 +70,7 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
 
     if (box.sizes().size() != 2 || box.size(0) != 3 || box.size(1) != 3) {
         std::ostringstream oss;
-        oss << "`box` must be 3 x 3 tensor, but the shape is " << points.sizes();
+        oss << "`box` must be 3 x 3 tensor, but the shape is " << box.sizes();
         C10_THROW_ERROR(ValueError, oss.str());
     }
 
@@ -127,53 +90,6 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
         C10_THROW_ERROR(ValueError, "`periodic` must be either a single bool or a tensor of 3 bool");
     }
 
-    // create calculation options
-    auto n_points = static_cast<size_t>(points.size(0));
-
-    // reset vesin data if device changed
-    if (data_->device.type != VesinUnknownDevice && data_->device.type != vesin_device.type) {
-        vesin_free(data_);
-        std::memset(data_, 0, sizeof(VesinNeighborList));
-    }
-
-    auto return_shifts = quantities.find('S') != std::string::npos;
-    if (box.requires_grad()) {
-        return_shifts = true;
-    }
-
-    auto return_distances = quantities.find('d') != std::string::npos;
-    auto return_vectors = quantities.find('D') != std::string::npos;
-    if ((points.requires_grad() || box.requires_grad()) &&
-        (return_distances || return_vectors)) {
-        // gradients requires both distances & vectors data to be present
-        return_distances = true;
-        return_vectors = true;
-    }
-
-    VesinAlgorithm algorithm = VesinAutoAlgorithm;
-    if (algorithm_ == "auto") {
-        algorithm = VesinAutoAlgorithm;
-    } else if (algorithm_ == "brute_force") {
-        algorithm = VesinBruteForce;
-    } else if (algorithm_ == "cell_list") {
-        algorithm = VesinCellList;
-    } else {
-        throw std::runtime_error(
-            "unknown algorithm '" + algorithm_ + "', expected one of "
-                                                 "'auto', 'brute_force', or 'cell_list'"
-        );
-    }
-
-    auto options = VesinOptions{
-        /*cutoff=*/this->cutoff_,
-        /*full=*/this->full_list_,
-        /*sorted=*/this->sorted_,
-        /*algorithm=*/algorithm,
-        /*return_shifts=*/return_shifts,
-        /*return_distances=*/return_distances,
-        /*return_vectors=*/return_vectors,
-    };
-
     if (!points.is_contiguous()) {
         points = points.contiguous();
     }
@@ -182,25 +98,67 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
         box = box.contiguous();
     }
 
-    const char* error_message = nullptr;
-    auto status = vesin_neighbors(
-        reinterpret_cast<const double (*)[3]>(points.data_ptr<double>()),
-        n_points,
-        reinterpret_cast<const double (*)[3]>(box.data_ptr<double>()),
-        periodic.data_ptr<bool>(),
-        vesin_device,
-        options,
-        data_,
-        &error_message
-    );
+    return vesin_device;
+}
 
-    if (status != EXIT_SUCCESS) {
-        throw std::runtime_error(std::string("failed to compute neighbors: ") + error_message);
+/// Parse quantities string and determine what to return.
+struct QuantityFlags {
+    bool return_shifts;
+    bool return_distances;
+    bool return_vectors;
+};
+
+static QuantityFlags parse_quantities(
+    const std::string& quantities,
+    bool points_grad,
+    bool box_grad
+) {
+    auto return_shifts = quantities.find('S') != std::string::npos;
+    if (box_grad) {
+        return_shifts = true;
     }
 
-    // wrap vesin data in tensors
+    auto return_distances = quantities.find('d') != std::string::npos;
+    auto return_vectors = quantities.find('D') != std::string::npos;
+    if ((points_grad || box_grad) && (return_distances || return_vectors)) {
+        return_distances = true;
+        return_vectors = true;
+    }
+
+    return {return_shifts, return_distances, return_vectors};
+}
+
+/// Wrap VesinNeighborList data into tensors, apply autograd, and assemble output.
+class AutogradNeighbors: public torch::autograd::Function<AutogradNeighbors> {
+public:
+    static std::vector<torch::Tensor> forward(
+        torch::autograd::AutogradContext* ctx,
+        torch::Tensor points,
+        torch::Tensor box,
+        torch::Tensor periodic,
+        torch::Tensor pairs,
+        torch::optional<torch::Tensor> shifts,
+        torch::optional<torch::Tensor> distances,
+        torch::optional<torch::Tensor> vectors
+    );
+
+    static std::vector<torch::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<torch::Tensor> outputs_grad
+    );
+};
+
+static std::vector<torch::Tensor> wrap_and_assemble(
+    VesinNeighborList* data,
+    torch::Tensor& points,
+    torch::Tensor& box,
+    torch::Tensor& periodic,
+    const std::string& quantities,
+    const QuantityFlags& flags,
+    bool copy
+) {
     auto size_t_options =
-        torch::TensorOptions().device(vesin_to_torch_device(data_->device));
+        torch::TensorOptions().device(vesin_to_torch_device(data->device));
     if (sizeof(size_t) == sizeof(uint32_t)) {
         size_t_options = size_t_options.dtype(torch::kUInt32);
     } else if (sizeof(size_t) == sizeof(uint64_t)) {
@@ -209,17 +167,17 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
         C10_THROW_ERROR(ValueError, "could not determine torch dtype matching size_t");
     }
 
-    int64_t length = static_cast<int64_t>(data_->length);
-    auto pairs = torch::from_blob(data_->pairs, {length, 2}, size_t_options)
+    int64_t length = static_cast<int64_t>(data->length);
+    auto pairs = torch::from_blob(data->pairs, {length, 2}, size_t_options)
                      .to(torch::kInt64);
 
     auto shifts = torch::Tensor();
-    if (data_->shifts != nullptr) {
+    if (data->shifts != nullptr) {
         auto int32_options = torch::TensorOptions()
-                                 .device(vesin_to_torch_device(data_->device))
+                                 .device(vesin_to_torch_device(data->device))
                                  .dtype(torch::kInt32);
 
-        shifts = torch::from_blob(data_->shifts, {length, 3}, int32_options);
+        shifts = torch::from_blob(data->shifts, {length, 3}, int32_options);
 
         if (copy) {
             shifts = shifts.clone();
@@ -227,12 +185,12 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
     }
 
     auto double_options = torch::TensorOptions()
-                              .device(vesin_to_torch_device(data_->device))
+                              .device(vesin_to_torch_device(data->device))
                               .dtype(torch::kDouble);
 
     auto distances = torch::Tensor();
-    if (data_->distances != nullptr) {
-        distances = torch::from_blob(data_->distances, {length}, double_options);
+    if (data->distances != nullptr) {
+        distances = torch::from_blob(data->distances, {length}, double_options);
 
         if (copy) {
             distances = distances.clone();
@@ -240,8 +198,8 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
     }
 
     auto vectors = torch::Tensor();
-    if (data_->vectors != nullptr) {
-        vectors = torch::from_blob(data_->vectors, {length, 3}, double_options);
+    if (data->vectors != nullptr) {
+        vectors = torch::from_blob(data->vectors, {length, 3}, double_options);
 
         if (copy) {
             vectors = vectors.clone();
@@ -249,9 +207,7 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
     }
 
     // handle autograd
-    if ((return_distances || return_vectors)) {
-        // we use optional for these three because otherwise torch autograd
-        // tries to access data inside the undefined `torch::Tensor()`.
+    if (flags.return_distances || flags.return_vectors) {
         torch::optional<torch::Tensor> shifts_optional = torch::nullopt;
         if (shifts.defined()) {
             shifts_optional = shifts;
@@ -270,13 +226,13 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
         auto outputs =
             AutogradNeighbors::apply(points, box, periodic, pairs, shifts_optional, distances_optional, vectors_optional);
 
-        if (return_distances && return_vectors) {
+        if (flags.return_distances && flags.return_vectors) {
             distances = outputs[0];
             vectors = outputs[1];
-        } else if (return_distances) {
+        } else if (flags.return_distances) {
             distances = outputs[0];
         } else {
-            assert(return_vectors);
+            assert(flags.return_vectors);
             vectors = outputs[0];
         }
     }
@@ -304,6 +260,191 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
     return output;
 }
 
+// ========================================================================== //
+// NeighborListHolder (stateless)                                             //
+// ========================================================================== //
+
+NeighborListHolder::NeighborListHolder(
+    double cutoff,
+    bool full_list,
+    bool sorted,
+    std::string algorithm
+):
+    cutoff_(cutoff),
+    full_list_(full_list),
+    sorted_(sorted),
+    algorithm_(std::move(algorithm)),
+    data_(nullptr) {
+    data_ = new VesinNeighborList();
+}
+
+NeighborListHolder::~NeighborListHolder() {
+    vesin_free(data_);
+    delete data_;
+}
+
+std::vector<torch::Tensor> NeighborListHolder::compute(
+    torch::Tensor points,
+    torch::Tensor box,
+    torch::Tensor periodic,
+    std::string quantities,
+    bool copy
+) {
+    auto vesin_device = validate_inputs(points, box, periodic);
+    auto flags = parse_quantities(quantities, points.requires_grad(), box.requires_grad());
+
+    auto n_points = static_cast<size_t>(points.size(0));
+
+    // reset vesin data if device changed
+    if (data_->device.type != VesinUnknownDevice && data_->device.type != vesin_device.type) {
+        vesin_free(data_);
+        std::memset(data_, 0, sizeof(VesinNeighborList));
+    }
+
+    VesinAlgorithm algorithm = VesinAutoAlgorithm;
+    if (algorithm_ == "auto") {
+        algorithm = VesinAutoAlgorithm;
+    } else if (algorithm_ == "brute_force") {
+        algorithm = VesinBruteForce;
+    } else if (algorithm_ == "cell_list") {
+        algorithm = VesinCellList;
+    } else {
+        throw std::runtime_error(
+            "unknown algorithm '" + algorithm_ + "', expected one of "
+                                                 "'auto', 'brute_force', or 'cell_list'"
+        );
+    }
+
+    auto options = VesinOptions{
+        /*cutoff=*/this->cutoff_,
+        /*full=*/this->full_list_,
+        /*sorted=*/this->sorted_,
+        /*algorithm=*/algorithm,
+        /*return_shifts=*/flags.return_shifts,
+        /*return_distances=*/flags.return_distances,
+        /*return_vectors=*/flags.return_vectors,
+    };
+
+    const char* error_message = nullptr;
+    auto status = vesin_neighbors(
+        reinterpret_cast<const double (*)[3]>(points.data_ptr<double>()),
+        n_points,
+        reinterpret_cast<const double (*)[3]>(box.data_ptr<double>()),
+        periodic.data_ptr<bool>(),
+        vesin_device,
+        options,
+        data_,
+        &error_message
+    );
+
+    if (status != EXIT_SUCCESS) {
+        throw std::runtime_error(std::string("failed to compute neighbors: ") + error_message);
+    }
+
+    return wrap_and_assemble(data_, points, box, periodic, quantities, flags, copy);
+}
+
+// ========================================================================== //
+// VerletNeighborListHolder (stateful, displacement-cached)                   //
+// ========================================================================== //
+
+VerletNeighborListHolder::VerletNeighborListHolder(
+    double cutoff,
+    double skin,
+    bool full_list,
+    bool sorted
+):
+    cutoff_(cutoff),
+    skin_(skin),
+    full_list_(full_list),
+    sorted_(sorted),
+    handle_(nullptr),
+    data_(nullptr) {
+
+    const char* error_message = nullptr;
+    handle_ = vesin_verlet_new(cutoff, skin, full_list, &error_message);
+    if (handle_ == nullptr) {
+        throw std::runtime_error(
+            std::string("failed to create Verlet neighbor list: ") + error_message
+        );
+    }
+    data_ = new VesinNeighborList();
+}
+
+VerletNeighborListHolder::~VerletNeighborListHolder() {
+    if (handle_ != nullptr) {
+        vesin_verlet_free(handle_);
+    }
+    if (data_ != nullptr) {
+        vesin_free(data_);
+        delete data_;
+    }
+}
+
+std::vector<torch::Tensor> VerletNeighborListHolder::compute(
+    torch::Tensor points,
+    torch::Tensor box,
+    torch::Tensor periodic,
+    std::string quantities,
+    bool copy
+) {
+    // Verlet is CPU-only
+    if (!points.device().is_cpu()) {
+        throw std::runtime_error(
+            "Verlet neighbor list is CPU-only, got device " + points.device().str()
+        );
+    }
+
+    validate_inputs(points, box, periodic);
+    auto flags = parse_quantities(quantities, points.requires_grad(), box.requires_grad());
+
+    auto n_points = static_cast<size_t>(points.size(0));
+
+    // The cutoff and full fields in VesinOptions are ignored by verlet_compute
+    // (they come from the VesinVerletList handle). We still need to set sorted
+    // and the return_* fields.
+    auto options = VesinOptions{
+        /*cutoff=*/0.0,
+        /*full=*/false,
+        /*sorted=*/this->sorted_,
+        /*algorithm=*/VesinAutoAlgorithm,
+        /*return_shifts=*/flags.return_shifts,
+        /*return_distances=*/flags.return_distances,
+        /*return_vectors=*/flags.return_vectors,
+    };
+
+    const char* error_message = nullptr;
+    auto status = vesin_verlet_compute(
+        handle_,
+        reinterpret_cast<const double (*)[3]>(points.data_ptr<double>()),
+        n_points,
+        reinterpret_cast<const double (*)[3]>(box.data_ptr<double>()),
+        periodic.data_ptr<bool>(),
+        options,
+        data_,
+        &error_message
+    );
+
+    if (status != EXIT_SUCCESS) {
+        throw std::runtime_error(
+            std::string("failed to compute Verlet neighbors: ") + error_message
+        );
+    }
+
+    return wrap_and_assemble(data_, points, box, periodic, quantities, flags, copy);
+}
+
+bool VerletNeighborListHolder::did_rebuild() {
+    if (handle_ == nullptr) {
+        return false;
+    }
+    return vesin_verlet_did_rebuild(handle_);
+}
+
+// ========================================================================== //
+// TorchScript registration                                                   //
+// ========================================================================== //
+
 TORCH_LIBRARY(vesin, m) {
     std::string DOCSTRING;
 
@@ -325,11 +466,30 @@ TORCH_LIBRARY(vesin, m) {
             torch::arg("copy") = true
         })
         ;
+
+    m.class_<VerletNeighborListHolder>("_VerletNeighborList")
+        .def(
+            torch::init<double, double, bool, bool>(), DOCSTRING, {
+                torch::arg("cutoff"),
+                torch::arg("skin"),
+                torch::arg("full_list"),
+                torch::arg("sorted") = false,
+            }
+        )
+        .def("compute", &VerletNeighborListHolder::compute, DOCSTRING, {
+            torch::arg("points"),
+            torch::arg("box"),
+            torch::arg("periodic"),
+            torch::arg("quantities"),
+            torch::arg("copy") = true
+        })
+        .def("did_rebuild", &VerletNeighborListHolder::did_rebuild)
+        ;
     // clang-format on
 }
 
 // ========================================================================== //
-//                                                                            //
+// Autograd implementation                                                    //
 // ========================================================================== //
 
 std::vector<torch::Tensor> AutogradNeighbors::forward(

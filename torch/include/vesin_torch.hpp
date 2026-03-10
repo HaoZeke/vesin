@@ -24,10 +24,12 @@
 // clang-format on
 
 struct VesinNeighborList;
+struct VesinVerletList;
 
 namespace vesin_torch {
 
 class NeighborListHolder;
+class VerletNeighborListHolder;
 
 /// `NeighborListHolder` should be manipulated through a `torch::intrusive_ptr`
 using NeighborList = torch::intrusive_ptr<NeighborListHolder>;
@@ -82,6 +84,46 @@ private:
     bool full_list_;
     bool sorted_;
     std::string algorithm_;
+    VesinNeighborList* data_;
+};
+
+/// `VerletNeighborListHolder` should be manipulated through a `torch::intrusive_ptr`
+using VerletNeighborList = torch::intrusive_ptr<VerletNeighborListHolder>;
+
+/// Verlet (displacement-cached) neighbor list calculator compatible with TorchScript.
+///
+/// Caches the pair topology from a spatial search with ``cutoff + skin`` and
+/// reuses it until any atom moves beyond ``skin / 2``.
+class VESIN_TORCH_API VerletNeighborListHolder: public torch::CustomClassHolder {
+public:
+    /// Create a new Verlet calculator.
+    ///
+    /// @param cutoff the spherical cutoff radius (without skin)
+    /// @param skin extra distance added to cutoff for the spatial search buffer
+    /// @param full_list whether pairs should be included twice (both i-j and j-i)
+    /// @param sorted whether pairs should be sorted in the output
+    VerletNeighborListHolder(double cutoff, double skin, bool full_list, bool sorted = false);
+    ~VerletNeighborListHolder();
+
+    /// Compute the neighbor list (using Verlet caching).
+    /// Same interface as NeighborListHolder::compute().
+    std::vector<torch::Tensor> compute(
+        torch::Tensor points,
+        torch::Tensor box,
+        torch::Tensor periodic,
+        std::string quantities,
+        bool copy = true
+    );
+
+    /// Whether the last compute() call performed a full rebuild.
+    bool did_rebuild();
+
+private:
+    double cutoff_;
+    double skin_;
+    bool full_list_;
+    bool sorted_;
+    VesinVerletList* handle_;
     VesinNeighborList* data_;
 };
 
