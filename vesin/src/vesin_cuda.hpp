@@ -66,6 +66,23 @@ struct CudaNeighborListExtras {
         float* cluster_bb_lower = nullptr;       // [max_clusters * 3]
         float* cluster_bb_upper = nullptr;       // [max_clusters * 3]
         int32_t* cell_offsets = nullptr;          // [max_cells + 1]
+
+        // GPU-native grid builder buffers
+        size_t grid_max_points = 0;
+        size_t grid_max_cells = 0;
+        int32_t* d_cell_indices = nullptr;       // [max_points]
+        float* d_atom_frac_z = nullptr;          // [max_points]
+        int32_t* d_cell_atom_counts = nullptr;   // [max_cells]
+        int32_t* d_cell_atom_starts = nullptr;   // [max_cells]
+        int32_t* d_cell_scatter_offsets = nullptr;// [max_cells] working copy for scatter
+        double* d_sorted_positions = nullptr;    // [max_points * 3]
+        int32_t* d_sorted_atom_indices = nullptr;// [max_points]
+        float* d_sorted_frac_z = nullptr;        // [max_points]
+        int32_t* d_n_clusters_total = nullptr;   // [1]
+        double* d_grid_inv_box = nullptr;        // [9]
+        int32_t* d_grid_n_cells = nullptr;       // [3]
+        int32_t* d_grid_n_search = nullptr;      // [3]
+        int32_t* d_grid_n_cells_total = nullptr; // [1]
     } cluster_pair;
 
     ~CudaNeighborListExtras();

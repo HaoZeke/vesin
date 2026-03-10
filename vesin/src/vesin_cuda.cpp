@@ -40,6 +40,10 @@ static const char* CUDA_CLUSTER_PAIR_CODE =
 #include "generated/cuda_cluster_pair.cu"
     ;
 
+static const char* CUDA_CLUSTER_GRID_CODE =
+#include "generated/cuda_cluster_grid.cu"
+    ;
+
 // Maximum number of cells (limited by single-block prefix sum)
 static constexpr size_t MAX_CELLS = 8192;
 
@@ -277,6 +281,21 @@ CudaNeighborListExtras::~CudaNeighborListExtras() {
     if (this->cluster_pair.cell_offsets != nullptr) {
         CUDART_INSTANCE.cudaFree(this->cluster_pair.cell_offsets);
     }
+
+    // Free GPU-native grid builder buffers
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_cell_indices);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_atom_frac_z);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_cell_atom_counts);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_cell_atom_starts);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_cell_scatter_offsets);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_sorted_positions);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_sorted_atom_indices);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_sorted_frac_z);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_n_clusters_total);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_grid_inv_box);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_grid_n_cells);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_grid_n_search);
+    CUDART_INSTANCE.cudaFree(this->cluster_pair.d_grid_n_cells_total);
 }
 
 vesin::cuda::CudaNeighborListExtras*
@@ -447,6 +466,55 @@ static void ensure_cell_list_buffers(
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cl.n_cells, sizeof(int32_t) * 3));
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cl.n_search, sizeof(int32_t) * 3));
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cl.n_cells_total, sizeof(int32_t)));
+    }
+}
+
+/// Ensure cluster grid builder GPU buffers are allocated with sufficient capacity.
+static void ensure_cluster_grid_buffers(
+    CudaNeighborListExtras::ClusterPairBuffers& cp,
+    size_t n_points,
+    size_t n_cells_total
+) {
+    bool need_realloc_points = (cp.grid_max_points < n_points);
+    bool need_realloc_cells = (cp.grid_max_cells < n_cells_total);
+
+    if (need_realloc_points) {
+        CUDART_INSTANCE.cudaFree(cp.d_cell_indices);
+        CUDART_INSTANCE.cudaFree(cp.d_atom_frac_z);
+        CUDART_INSTANCE.cudaFree(cp.d_sorted_positions);
+        CUDART_INSTANCE.cudaFree(cp.d_sorted_atom_indices);
+        CUDART_INSTANCE.cudaFree(cp.d_sorted_frac_z);
+
+        auto new_max = static_cast<size_t>(1.2 * static_cast<double>(n_points)) + 16;
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_cell_indices, sizeof(int32_t) * new_max));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_atom_frac_z, sizeof(float) * new_max));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_sorted_positions, sizeof(double) * new_max * 3));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_sorted_atom_indices, sizeof(int32_t) * new_max));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_sorted_frac_z, sizeof(float) * new_max));
+        cp.grid_max_points = new_max;
+    }
+
+    if (need_realloc_cells) {
+        CUDART_INSTANCE.cudaFree(cp.d_cell_atom_counts);
+        CUDART_INSTANCE.cudaFree(cp.d_cell_atom_starts);
+        CUDART_INSTANCE.cudaFree(cp.d_cell_scatter_offsets);
+
+        auto new_max = static_cast<size_t>(1.2 * static_cast<double>(n_cells_total)) + 16;
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_cell_atom_counts, sizeof(int32_t) * new_max));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_cell_atom_starts, sizeof(int32_t) * new_max));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_cell_scatter_offsets, sizeof(int32_t) * new_max));
+        cp.grid_max_cells = new_max;
+    }
+
+    // Fixed-size buffers (only allocate once)
+    if (cp.d_n_clusters_total == nullptr) {
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_n_clusters_total, sizeof(int32_t)));
+    }
+    if (cp.d_grid_inv_box == nullptr) {
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_grid_inv_box, sizeof(double) * 9));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_grid_n_cells, sizeof(int32_t) * 3));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_grid_n_search, sizeof(int32_t) * 3));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.d_grid_n_cells_total, sizeof(int32_t)));
     }
 }
 
@@ -876,38 +944,211 @@ void vesin::cuda::neighbors(
     if (use_cluster_pair) {
         NVTX_PUSH("cluster_pair_total");
 
-        // Copy positions to host for cluster grid construction
-        std::vector<double> h_positions(n_points * 3);
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
-            h_positions.data(), d_positions, sizeof(double) * n_points * 3,
-            cudaMemcpyDeviceToHost
-        ));
+        auto& cp = extras->cluster_pair;
+        size_t THREADS_PER_BLOCK_CG = 256;
+        size_t num_blocks_points_cg = (n_points + THREADS_PER_BLOCK_CG - 1) / THREADS_PER_BLOCK_CG;
 
-        // Copy box and periodic to host
-        double h_box[3][3];
-        bool h_periodic[3];
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
-            h_box, d_box, sizeof(double) * 9, cudaMemcpyDeviceToHost
-        ));
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
-            h_periodic, d_periodic, sizeof(bool) * 3, cudaMemcpyDeviceToHost
-        ));
+        // --- GPU-native cluster grid builder ---
+        // All grid construction happens on-device, no D2H/H2D transfers
+        // except a single 4-byte D2H for n_clusters_total.
 
-        NVTX_PUSH("build_cluster_grid");
-        auto grid_info = build_and_upload_cluster_grid(
-            h_positions.data(), n_points, h_box, h_periodic,
-            options.cutoff, extras->cluster_pair
+        NVTX_PUSH("build_cluster_grid_gpu");
+
+        // Ensure grid builder buffers are allocated
+        ensure_cluster_grid_buffers(cp, n_points, MAX_CELLS);
+
+        // Kernel 1: Compute grid parameters (inv_box, n_cells, n_search)
+        int32_t max_cells_cp = 100000; // cluster-pair cell limit
+        auto* grid_params_kernel = factory.create(
+            "compute_cluster_grid_params",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
         );
-        NVTX_POP();
+        std::vector<void*> grid_params_args = {
+            static_cast<void*>(&d_box),
+            static_cast<void*>(&d_periodic),
+            static_cast<void*>(&options.cutoff),
+            static_cast<void*>(&max_cells_cp),
+            static_cast<void*>(&n_points),
+            static_cast<void*>(&cp.d_grid_inv_box),
+            static_cast<void*>(&cp.d_grid_n_cells),
+            static_cast<void*>(&cp.d_grid_n_search),
+            static_cast<void*>(&cp.d_grid_n_cells_total),
+        };
+        grid_params_kernel->launch(dim3(1), dim3(1), 0, nullptr, grid_params_args, false);
 
-        // Upload grid parameters to GPU
-        int32_t* d_n_cells = nullptr;
-        int32_t* d_n_search = nullptr;
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&d_n_cells, sizeof(int32_t) * 3));
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&d_n_search, sizeof(int32_t) * 3));
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(d_n_cells, grid_info.n_cells, sizeof(int32_t) * 3, cudaMemcpyHostToDevice));
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(d_n_search, grid_info.n_search, sizeof(int32_t) * 3, cudaMemcpyHostToDevice));
+        // Kernel 2: Assign atoms to cells
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemset(cp.d_cell_atom_counts, 0, sizeof(int32_t) * MAX_CELLS));
+        auto* assign_kernel = factory.create(
+            "assign_cell_indices_cluster",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
+        );
+        std::vector<void*> assign_args = {
+            static_cast<void*>(&d_positions),
+            static_cast<void*>(&cp.d_grid_inv_box),
+            static_cast<void*>(&d_periodic),
+            static_cast<void*>(&cp.d_grid_n_cells),
+            static_cast<void*>(&n_points),
+            static_cast<void*>(&cp.d_cell_indices),
+            static_cast<void*>(&cp.d_atom_frac_z),
+        };
+        assign_kernel->launch(
+            dim3(num_blocks_points_cg), dim3(THREADS_PER_BLOCK_CG),
+            0, nullptr, assign_args, false
+        );
 
+        // Kernel 3a: Count atoms per cell
+        auto* count_kernel = factory.create(
+            "count_atoms_per_cell",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
+        );
+        std::vector<void*> count_args = {
+            static_cast<void*>(&cp.d_cell_indices),
+            static_cast<void*>(&n_points),
+            static_cast<void*>(&cp.d_cell_atom_counts),
+        };
+        count_kernel->launch(
+            dim3(num_blocks_points_cg), dim3(THREADS_PER_BLOCK_CG),
+            0, nullptr, count_args, false
+        );
+
+        // Kernel 3b: Prefix sum for cell starts
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemset(cp.d_cell_atom_starts, 0, sizeof(int32_t) * MAX_CELLS));
+        auto* prefix_kernel = factory.create(
+            "prefix_sum_cluster_cells",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
+        );
+        std::vector<void*> prefix_args = {
+            static_cast<void*>(&cp.d_cell_atom_counts),
+            static_cast<void*>(&cp.d_cell_atom_starts),
+            static_cast<void*>(&cp.d_grid_n_cells_total),
+        };
+        size_t prefix_threads = 256;
+        size_t shared_mem_cg = sizeof(int32_t) * prefix_threads;
+        prefix_kernel->launch(
+            dim3(1), dim3(prefix_threads), shared_mem_cg, nullptr, prefix_args, false
+        );
+
+        // Copy cell_starts -> scatter offsets (working copy for atomicAdd scatter)
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+            cp.d_cell_scatter_offsets, cp.d_cell_atom_starts,
+            sizeof(int32_t) * MAX_CELLS, cudaMemcpyDeviceToDevice
+        ));
+
+        // Kernel 4: Scatter atoms into sorted order
+        auto* scatter_kernel = factory.create(
+            "scatter_atoms_by_cell",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
+        );
+        std::vector<void*> scatter_args = {
+            static_cast<void*>(&d_positions),
+            static_cast<void*>(&cp.d_cell_indices),
+            static_cast<void*>(&cp.d_atom_frac_z),
+            static_cast<void*>(&cp.d_cell_scatter_offsets),
+            static_cast<void*>(&n_points),
+            static_cast<void*>(&cp.d_sorted_positions),
+            static_cast<void*>(&cp.d_sorted_atom_indices),
+            static_cast<void*>(&cp.d_sorted_frac_z),
+        };
+        scatter_kernel->launch(
+            dim3(num_blocks_points_cg), dim3(THREADS_PER_BLOCK_CG),
+            0, nullptr, scatter_args, false
+        );
+
+        // Reset n_clusters_total counter
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemset(cp.d_n_clusters_total, 0, sizeof(int32_t)));
+
+        // Ensure cluster output buffers are large enough.
+        // Estimate max clusters: n_points / CLUSTER_SIZE_GPU + n_cells_total
+        size_t est_clusters = n_points / CLUSTER_SIZE_GPU + MAX_CELLS + 16;
+        if (est_clusters > cp.max_clusters) {
+            auto new_max = static_cast<size_t>(1.2 * static_cast<double>(est_clusters)) + 16;
+            CUDART_INSTANCE.cudaFree(cp.cluster_atom_indices);
+            CUDART_INSTANCE.cudaFree(cp.cluster_n_atoms);
+            CUDART_INSTANCE.cudaFree(cp.cluster_bb_lower);
+            CUDART_INSTANCE.cudaFree(cp.cluster_bb_upper);
+            CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.cluster_atom_indices, sizeof(int32_t) * new_max * CLUSTER_SIZE_GPU));
+            CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.cluster_n_atoms, sizeof(int32_t) * new_max));
+            CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.cluster_bb_lower, sizeof(float) * new_max * 3));
+            CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.cluster_bb_upper, sizeof(float) * new_max * 3));
+            cp.max_clusters = new_max;
+        }
+        size_t n_cells_plus_1 = MAX_CELLS + 1;
+        if (n_cells_plus_1 > cp.max_cells) {
+            auto new_max = static_cast<size_t>(1.2 * static_cast<double>(n_cells_plus_1)) + 16;
+            CUDART_INSTANCE.cudaFree(cp.cell_offsets);
+            CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&cp.cell_offsets, sizeof(int32_t) * new_max));
+            cp.max_cells = new_max;
+        }
+
+        // D2H: read n_cells_total to size kernel 5 launch
+        int32_t h_n_cells_total = 0;
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+            &h_n_cells_total, cp.d_grid_n_cells_total,
+            sizeof(int32_t), cudaMemcpyDeviceToHost
+        ));
+
+        // Kernel 5: Build clusters and bounding boxes (one thread per cell)
+        auto* build_kernel = factory.create(
+            "build_clusters_and_bboxes",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
+        );
+        size_t num_blocks_cells = (h_n_cells_total + THREADS_PER_BLOCK_CG - 1) / THREADS_PER_BLOCK_CG;
+        std::vector<void*> build_args = {
+            static_cast<void*>(&cp.d_sorted_positions),
+            static_cast<void*>(&cp.d_sorted_atom_indices),
+            static_cast<void*>(&cp.d_sorted_frac_z),
+            static_cast<void*>(&cp.d_cell_atom_starts),
+            static_cast<void*>(&cp.d_cell_atom_counts),
+            static_cast<void*>(&cp.d_grid_n_cells_total),
+            static_cast<void*>(&cp.cluster_atom_indices),
+            static_cast<void*>(&cp.cluster_n_atoms),
+            static_cast<void*>(&cp.cluster_bb_lower),
+            static_cast<void*>(&cp.cluster_bb_upper),
+            static_cast<void*>(&cp.cell_offsets),
+            static_cast<void*>(&cp.d_n_clusters_total),
+        };
+        build_kernel->launch(
+            dim3(std::max(num_blocks_cells, static_cast<size_t>(1))),
+            dim3(THREADS_PER_BLOCK_CG),
+            0, nullptr, build_args, false
+        );
+
+        // Kernel 6: Finalize cell_cluster_offsets sentinel
+        auto* finalize_kernel = factory.create(
+            "finalize_cluster_offsets",
+            CUDA_CLUSTER_GRID_CODE,
+            "cuda_cluster_grid.cu",
+            {"-std=c++17"}
+        );
+        std::vector<void*> finalize_args = {
+            static_cast<void*>(&cp.cell_offsets),
+            static_cast<void*>(&cp.d_grid_n_cells_total),
+            static_cast<void*>(&cp.d_n_clusters_total),
+        };
+        finalize_kernel->launch(dim3(1), dim3(1), 0, nullptr, finalize_args, false);
+
+        // D2H: read n_clusters_total for kernel launch sizing
+        int32_t h_n_clusters_total = 0;
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+            &h_n_clusters_total, cp.d_n_clusters_total,
+            sizeof(int32_t), cudaMemcpyDeviceToHost
+        ));
+
+        NVTX_POP(); // build_cluster_grid_gpu
+
+        // --- Launch cluster-pair search kernel ---
         NVTX_PUSH("cluster_pair_kernel");
         auto* kernel = factory.create(
             "cluster_pair_search",
@@ -916,9 +1157,8 @@ void vesin::cuda::neighbors(
             {"-std=c++17"}
         );
 
-        int n_clusters_total = grid_info.n_clusters_total;
-        int n_cells_total_int = grid_info.n_cells_total;
-        auto& cp = extras->cluster_pair;
+        int n_clusters_total = h_n_clusters_total;
+        int n_cells_total_int = h_n_cells_total;
         std::vector<void*> args = {
             static_cast<void*>(&d_positions),
             static_cast<void*>(&cp.cluster_atom_indices),
@@ -929,8 +1169,8 @@ void vesin::cuda::neighbors(
             static_cast<void*>(&n_clusters_total),
             static_cast<void*>(&d_box),
             static_cast<void*>(&d_periodic),
-            static_cast<void*>(&d_n_cells),
-            static_cast<void*>(&d_n_search),
+            static_cast<void*>(&cp.d_grid_n_cells),
+            static_cast<void*>(&cp.d_grid_n_search),
             static_cast<void*>(&n_cells_total_int),
             static_cast<void*>(&options.cutoff),
             static_cast<void*>(&options.full),
@@ -954,10 +1194,6 @@ void vesin::cuda::neighbors(
             0, nullptr, args, false
         );
         NVTX_POP();
-
-        // Free temporary GPU allocations
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaFree(d_n_cells));
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaFree(d_n_search));
 
         NVTX_POP(); // cluster_pair_total
     } else if (use_cell_list) {
