@@ -813,7 +813,6 @@ void vesin::cuda::neighbors(
 
     if (extras->capacity >= n_points && (extras->length_ptr != nullptr)) {
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemset(extras->length_ptr, 0, sizeof(size_t)));
-        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemset(extras->cell_check_ptr, 0, sizeof(int32_t)));
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemset(extras->overflow_flag, 0, sizeof(int32_t)));
     } else {
         auto saved_device = extras->allocated_device_id;
@@ -892,6 +891,21 @@ void vesin::cuda::neighbors(
 
     auto& factory = KernelFactory::instance(device_id);
 
+    // CPU-side box parameter computation: avoids GPU kernel launch + 2 D2H syncs.
+    // Copy box and periodic from device to host (75 bytes total), compute on CPU,
+    // then upload needed params back to device.
+    double h_box[9];
+    bool h_periodic[3];
+    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(h_box, d_box, sizeof(double) * 9, cudaMemcpyDeviceToHost));
+    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(h_periodic, d_periodic, sizeof(bool) * 3, cudaMemcpyDeviceToHost));
+
+    double h_box_diag[3];
+    double h_inv_box[9];
+    auto [box_valid, is_orthogonal] = cpu_box_check(
+        h_box, h_periodic, options.cutoff, h_box_diag, h_inv_box
+    );
+    bool box_check_error = !box_valid;
+
     if (extras->box_diag == nullptr) {
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&extras->box_diag, sizeof(double) * 3));
     }
@@ -899,37 +913,8 @@ void vesin::cuda::neighbors(
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&extras->inv_box_brute, sizeof(double) * 9));
     }
 
-    auto* box_check_kernel = factory.create(
-        "mic_box_check",
-        CUDA_BRUTEFORCE_CODE,
-        "cuda_bruteforce.cu",
-        {"-std=c++17"}
-    );
-
     double* d_box_diag = extras->box_diag;
     double* d_inv_box_brute = extras->inv_box_brute;
-    std::vector<void*> box_check_args = {
-        static_cast<void*>(&d_box),
-        static_cast<void*>(&d_periodic),
-        static_cast<void*>(&options.cutoff),
-        static_cast<void*>(&d_cell_check),
-        static_cast<void*>(&d_box_diag),
-        static_cast<void*>(&d_inv_box_brute),
-    };
-
-    box_check_kernel->launch(dim3(1), dim3(32), 0, nullptr, box_check_args, false);
-
-    int32_t h_cell_check = 1;
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(&h_cell_check, d_cell_check, sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-    bool box_check_error = (h_cell_check & 1) != 0;
-    bool is_orthogonal = (h_cell_check & 2) != 0;
-
-    // Get box dimensions for auto algorithm selection
-    double h_box_diag[3];
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(h_box_diag, d_box_diag, sizeof(double) * 3, cudaMemcpyDeviceToHost));
-    double min_box_dim = std::min({h_box_diag[0], h_box_diag[1], h_box_diag[2]});
-    bool cutoff_requires_cell_list = options.cutoff > min_box_dim / 2.0;
 
     bool use_cell_list = false;
     bool use_cluster_pair = false;
@@ -944,12 +929,27 @@ void vesin::cuda::neighbors(
         break;
     case VesinAutoAlgorithm:
     default:
-        // GPU cluster-pair has insufficient parallelism (1 thread per
-        // i-cluster = N/8 threads) vs cell-list (1 thread per atom = N
-        // threads). Use cell-list on GPU until the cluster-pair kernel is
-        // redesigned for better occupancy.
-        use_cell_list = true;
+        // For small systems, brute-force has lower overhead: 1 kernel launch
+        // vs 7+ for cell-list. O(N^2) pair checks are fast on GPU when N is
+        // small. For large systems, cell-list O(N) complexity dominates.
+        if (n_points <= 3000 && !box_check_error) {
+            // brute-force: fewer API calls, better for small N
+        } else {
+            use_cell_list = true;
+        }
         break;
+    }
+
+    // Upload box params to device only for brute-force path
+    if (!use_cell_list && !use_cluster_pair) {
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+            d_box_diag, h_box_diag, sizeof(double) * 3, cudaMemcpyHostToDevice
+        ));
+        if (!is_orthogonal) {
+            CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+                d_inv_box_brute, h_inv_box, sizeof(double) * 9, cudaMemcpyHostToDevice
+            ));
+        }
     }
 
     if (use_cluster_pair) {
