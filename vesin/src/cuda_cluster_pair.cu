@@ -67,6 +67,7 @@ __device__ inline float bb_distance_sq_gpu(
 extern "C" __global__ void cluster_pair_search(
     const double* __restrict__ positions,
     const int* __restrict__ cluster_atom_indices,
+    const int* __restrict__ cluster_atom_shifts,
     const int* __restrict__ cluster_n_atoms,
     const float* __restrict__ cluster_bb_lower,
     const float* __restrict__ cluster_bb_upper,
@@ -103,11 +104,15 @@ extern "C" __global__ void cluster_pair_search(
     int ni_atoms = cluster_n_atoms[ci_global];
     int ci_atom_idx[CLUSTER_SIZE_GPU];
     double ci_pos[CLUSTER_SIZE_GPU][3];
+    int ci_shift[CLUSTER_SIZE_GPU][3];
     for (int k = 0; k < ni_atoms; k++) {
         ci_atom_idx[k] = cluster_atom_indices[ci_global * CLUSTER_SIZE_GPU + k];
         ci_pos[k][0] = positions[ci_atom_idx[k] * 3 + 0];
         ci_pos[k][1] = positions[ci_atom_idx[k] * 3 + 1];
         ci_pos[k][2] = positions[ci_atom_idx[k] * 3 + 2];
+        ci_shift[k][0] = cluster_atom_shifts[(ci_global * CLUSTER_SIZE_GPU + k) * 3 + 0];
+        ci_shift[k][1] = cluster_atom_shifts[(ci_global * CLUSTER_SIZE_GPU + k) * 3 + 1];
+        ci_shift[k][2] = cluster_atom_shifts[(ci_global * CLUSTER_SIZE_GPU + k) * 3 + 2];
     }
 
     float bbi_lower[3], bbi_upper[3];
@@ -183,16 +188,11 @@ extern "C" __global__ void cluster_pair_search(
         int cj_start = cell_offsets[cell_j];
         int cj_end = cell_offsets[cell_j + 1];
 
-        // Shift vector in Cartesian coordinates
-        double shift_cart_x = sx * box[0] + sy * box[3] + sz * box[6];
-        double shift_cart_y = sx * box[1] + sy * box[4] + sz * box[7];
-        double shift_cart_z = sx * box[2] + sy * box[5] + sz * box[8];
-
-        bool shift_is_zero = (sx == 0 && sy == 0 && sz == 0);
+        bool cell_shift_is_zero = (sx == 0 && sy == 0 && sz == 0);
 
         for (int cj = cj_start; cj < cj_end; cj++) {
-            // BB distance test (only for same-image pairs)
-            if (shift_is_zero) {
+            // BB distance test (only for same-cell-image pairs)
+            if (cell_shift_is_zero) {
                 float bbj_lower[3], bbj_upper[3];
                 bbj_lower[0] = cluster_bb_lower[cj * 3 + 0];
                 bbj_lower[1] = cluster_bb_lower[cj * 3 + 1];
@@ -211,19 +211,35 @@ extern "C" __global__ void cluster_pair_search(
             int nj_atoms = cluster_n_atoms[cj];
             for (int ai = 0; ai < ni_atoms; ai++) {
                 int idx_i = ci_atom_idx[ai];
+                int si_x = ci_shift[ai][0];
+                int si_y = ci_shift[ai][1];
+                int si_z = ci_shift[ai][2];
+
                 for (int aj = 0; aj < nj_atoms; aj++) {
                     int idx_j = cluster_atom_indices[cj * CLUSTER_SIZE_GPU + aj];
 
+                    // Per-atom wrapping shifts for j
+                    int sj_x = cluster_atom_shifts[(cj * CLUSTER_SIZE_GPU + aj) * 3 + 0];
+                    int sj_y = cluster_atom_shifts[(cj * CLUSTER_SIZE_GPU + aj) * 3 + 1];
+                    int sj_z = cluster_atom_shifts[(cj * CLUSTER_SIZE_GPU + aj) * 3 + 2];
+
+                    // Total shift = shift_i - shift_j + cell_shift
+                    int total_sx = si_x - sj_x + sx;
+                    int total_sy = si_y - sj_y + sy;
+                    int total_sz = si_z - sj_z + sz;
+
+                    bool total_shift_is_zero = (total_sx == 0 && total_sy == 0 && total_sz == 0);
+
                     // Self-pair exclusion
-                    if (idx_i == idx_j && shift_is_zero) continue;
+                    if (idx_i == idx_j && total_shift_is_zero) continue;
 
                     // Half-list filtering
                     if (!is_full_list) {
                         if (idx_i > idx_j) continue;
                         if (idx_i == idx_j) {
-                            int s_sum = sx + sy + sz;
+                            int s_sum = total_sx + total_sy + total_sz;
                             if (s_sum < 0) continue;
-                            if (s_sum == 0 && (sz < 0 || (sz == 0 && sy < 0))) continue;
+                            if (s_sum == 0 && (total_sz < 0 || (total_sz == 0 && total_sy < 0))) continue;
                         }
                     }
 
@@ -231,9 +247,14 @@ extern "C" __global__ void cluster_pair_search(
                     double pj_y = positions[idx_j * 3 + 1];
                     double pj_z = positions[idx_j * 3 + 2];
 
-                    double vx = pj_x - ci_pos[ai][0] + shift_cart_x;
-                    double vy = pj_y - ci_pos[ai][1] + shift_cart_y;
-                    double vz = pj_z - ci_pos[ai][2] + shift_cart_z;
+                    // Distance vector using total shift
+                    double total_cart_x = total_sx * box[0] + total_sy * box[3] + total_sz * box[6];
+                    double total_cart_y = total_sx * box[1] + total_sy * box[4] + total_sz * box[7];
+                    double total_cart_z = total_sx * box[2] + total_sy * box[5] + total_sz * box[8];
+
+                    double vx = pj_x - ci_pos[ai][0] + total_cart_x;
+                    double vy = pj_y - ci_pos[ai][1] + total_cart_y;
+                    double vz = pj_z - ci_pos[ai][2] + total_cart_z;
 
                     double dist2 = vx * vx + vy * vy + vz * vz;
 
@@ -241,9 +262,9 @@ extern "C" __global__ void cluster_pair_search(
                         // Buffer the pair
                         buf_i[buf_count] = static_cast<size_t>(idx_i);
                         buf_j[buf_count] = static_cast<size_t>(idx_j);
-                        buf_sx[buf_count] = sx;
-                        buf_sy[buf_count] = sy;
-                        buf_sz[buf_count] = sz;
+                        buf_sx[buf_count] = total_sx;
+                        buf_sy[buf_count] = total_sy;
+                        buf_sz[buf_count] = total_sz;
                         buf_dist[buf_count] = sqrt(dist2);
                         buf_vx[buf_count] = vx;
                         buf_vy[buf_count] = vy;

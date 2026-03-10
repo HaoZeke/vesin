@@ -98,7 +98,7 @@ __global__ void compute_cluster_grid_params(
 }
 
 // Kernel 2: Assign atoms to cells via fractional coordinates.
-// Also stores fractional z for within-cell sorting.
+// Also stores fractional z for within-cell sorting, and per-atom wrapping shifts.
 __global__ void assign_cell_indices_cluster(
     const double* __restrict__ positions,
     const double* __restrict__ inv_box,
@@ -106,7 +106,8 @@ __global__ void assign_cell_indices_cluster(
     const int* __restrict__ n_cells,
     size_t n_points,
     int* __restrict__ cell_indices,
-    float* __restrict__ atom_frac_z
+    float* __restrict__ atom_frac_z,
+    int* __restrict__ particle_shifts
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_points) {
@@ -123,11 +124,12 @@ __global__ void assign_cell_indices_cluster(
     frac[2] = pos.x * inv_box[2] + pos.y * inv_box[5] + pos.z * inv_box[8];
 
     int cell_idx[3];
+    int shift[3] = {0, 0, 0};
 
     for (int d = 0; d < 3; d++) {
         if (periodic[d]) {
-            int shift = (int)floor(frac[d]);
-            frac[d] -= shift;
+            shift[d] = (int)floor(frac[d]);
+            frac[d] -= shift[d];
         } else {
             frac[d] = fmax(0.0, fmin(frac[d], 1.0 - 1e-10));
         }
@@ -137,6 +139,9 @@ __global__ void assign_cell_indices_cluster(
 
     cell_indices[idx] = cell_idx[0] + cell_idx[1] * n_cells[0] + cell_idx[2] * n_cells[0] * n_cells[1];
     atom_frac_z[idx] = (float)frac[2];
+    particle_shifts[idx * 3 + 0] = shift[0];
+    particle_shifts[idx * 3 + 1] = shift[1];
+    particle_shifts[idx * 3 + 2] = shift[2];
 }
 
 // Kernel 3a: Count atoms per cell (histogram via atomicAdd)
@@ -200,10 +205,12 @@ __global__ void scatter_atoms_by_cell(
     const double* __restrict__ positions,
     const int* __restrict__ cell_indices,
     const float* __restrict__ atom_frac_z,
+    const int* __restrict__ particle_shifts,
     int* __restrict__ cell_offsets,
     size_t n_points,
     double* __restrict__ sorted_positions,
     int* __restrict__ sorted_atom_indices,
+    int* __restrict__ sorted_shifts,
     float* __restrict__ sorted_frac_z
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -220,26 +227,92 @@ __global__ void scatter_atoms_by_cell(
     pos_out[slot] = pos_in[i];
 
     sorted_atom_indices[slot] = static_cast<int>(i);
+    sorted_shifts[slot * 3 + 0] = particle_shifts[i * 3 + 0];
+    sorted_shifts[slot * 3 + 1] = particle_shifts[i * 3 + 1];
+    sorted_shifts[slot * 3 + 2] = particle_shifts[i * 3 + 2];
     sorted_frac_z[slot] = atom_frac_z[i];
 }
 
-// Kernel 5: Build clusters from sorted atoms and compute bounding boxes.
-// One thread per cell. Groups atoms within the cell into clusters of
-// CLUSTER_SIZE_GPU, sorts by frac_z (insertion sort for small groups),
-// and computes AABB bounding boxes.
+// Kernel 5a: Compute number of clusters per cell from cell_counts.
+// Writes cluster counts and does a prefix sum to get cell_cluster_offsets.
+// Must run before build_clusters_and_bboxes to provide deterministic offsets.
+__global__ void compute_cluster_counts(
+    const int* __restrict__ cell_counts,
+    const int* __restrict__ n_cells_total_ptr,
+    int* __restrict__ cluster_counts  // [n_cells_total], output: n_clusters per cell
+) {
+    int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_cells_total = n_cells_total_ptr[0];
+    if (cell >= n_cells_total) {
+        return;
+    }
+    int count = min(cell_counts[cell], 256);
+    cluster_counts[cell] = (count + CLUSTER_SIZE_GPU - 1) / CLUSTER_SIZE_GPU;
+}
+
+// Kernel 5b: Prefix sum of cluster_counts -> cell_cluster_offsets (CSR).
+// Also writes n_clusters_total_out[0] = total number of clusters.
+// Single block, same pattern as prefix_sum_cluster_cells.
+__global__ void prefix_sum_cluster_offsets(
+    const int* __restrict__ cluster_counts,
+    int* __restrict__ cell_cluster_offsets,
+    const int* __restrict__ n_cells_total_ptr,
+    int* __restrict__ n_clusters_total_out
+) {
+    extern __shared__ int shared[];
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int n_cells_total = n_cells_total_ptr[0];
+
+    int chunk_size = (n_cells_total + nthreads - 1) / nthreads;
+    int start = tid * chunk_size;
+    int end = min(start + chunk_size, n_cells_total);
+
+    int local_sum = 0;
+    for (int i = start; i < end; i++) {
+        int val = cluster_counts[i];
+        cell_cluster_offsets[i] = local_sum;
+        local_sum += val;
+    }
+
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    if (tid == 0) {
+        int sum = 0;
+        for (int i = 0; i < nthreads; i++) {
+            int val = shared[i];
+            shared[i] = sum;
+            sum += val;
+        }
+        n_clusters_total_out[0] = sum;
+    }
+    __syncthreads();
+
+    int offset = shared[tid];
+    for (int i = start; i < end; i++) {
+        cell_cluster_offsets[i] += offset;
+    }
+}
+
+// Kernel 5c: Build clusters from sorted atoms and compute bounding boxes.
+// One thread per cell. Uses pre-computed cell_cluster_offsets (CSR) for
+// deterministic cluster placement. Groups atoms within the cell into
+// clusters of CLUSTER_SIZE_GPU, sorts by frac_z (insertion sort).
 __global__ void build_clusters_and_bboxes(
     const double* __restrict__ sorted_positions,
     const int* __restrict__ sorted_atom_indices,
+    const int* __restrict__ sorted_shifts,
     const float* __restrict__ sorted_frac_z,
     const int* __restrict__ cell_starts,
     const int* __restrict__ cell_counts,
     const int* __restrict__ n_cells_total_ptr,
+    const int* __restrict__ cell_cluster_offsets,
     int* __restrict__ cluster_atom_indices,
+    int* __restrict__ cluster_atom_shifts,
     int* __restrict__ cluster_n_atoms,
     float* __restrict__ cluster_bb_lower,
-    float* __restrict__ cluster_bb_upper,
-    int* __restrict__ cell_cluster_offsets,
-    int* __restrict__ n_clusters_total_out
+    float* __restrict__ cluster_bb_upper
 ) {
     int cell = blockIdx.x * blockDim.x + threadIdx.x;
     int n_cells_total = n_cells_total_ptr[0];
@@ -252,7 +325,6 @@ __global__ void build_clusters_and_bboxes(
 
     // Sort atoms in this cell by frac_z using insertion sort
     // (count is typically small: 8-64 atoms per cell)
-    // We sort indices locally, not the global arrays
     int local_order[256]; // max atoms per cell
     int actual_count = min(count, 256);
     for (int i = 0; i < actual_count; i++) {
@@ -269,12 +341,9 @@ __global__ void build_clusters_and_bboxes(
         local_order[j + 1] = key;
     }
 
-    // Compute cluster offset for this cell (use atomicAdd on total counter)
+    // Read pre-computed cluster offset for this cell (deterministic CSR)
+    int cluster_base = cell_cluster_offsets[cell];
     int n_clusters_this_cell = (actual_count + CLUSTER_SIZE_GPU - 1) / CLUSTER_SIZE_GPU;
-    int cluster_base = atomicAdd(n_clusters_total_out, n_clusters_this_cell);
-
-    // Store cell cluster offset
-    cell_cluster_offsets[cell] = cluster_base;
 
     // Build clusters
     for (int ci = 0; ci < n_clusters_this_cell; ci++) {
@@ -291,6 +360,11 @@ __global__ void build_clusters_and_bboxes(
                 int atom_idx = sorted_atom_indices[sorted_idx];
                 cluster_atom_indices[cluster_idx * CLUSTER_SIZE_GPU + k] = atom_idx;
 
+                // Copy per-atom wrapping shifts
+                cluster_atom_shifts[(cluster_idx * CLUSTER_SIZE_GPU + k) * 3 + 0] = sorted_shifts[sorted_idx * 3 + 0];
+                cluster_atom_shifts[(cluster_idx * CLUSTER_SIZE_GPU + k) * 3 + 1] = sorted_shifts[sorted_idx * 3 + 1];
+                cluster_atom_shifts[(cluster_idx * CLUSTER_SIZE_GPU + k) * 3 + 2] = sorted_shifts[sorted_idx * 3 + 2];
+
                 // Update bounding box from original positions
                 float px = (float)sorted_positions[sorted_idx * 3 + 0];
                 float py = (float)sorted_positions[sorted_idx * 3 + 1];
@@ -304,6 +378,9 @@ __global__ void build_clusters_and_bboxes(
                 bb_hi[2] = fmaxf(bb_hi[2], pz);
             } else {
                 cluster_atom_indices[cluster_idx * CLUSTER_SIZE_GPU + k] = -1; // padding
+                cluster_atom_shifts[(cluster_idx * CLUSTER_SIZE_GPU + k) * 3 + 0] = 0;
+                cluster_atom_shifts[(cluster_idx * CLUSTER_SIZE_GPU + k) * 3 + 1] = 0;
+                cluster_atom_shifts[(cluster_idx * CLUSTER_SIZE_GPU + k) * 3 + 2] = 0;
             }
         }
 

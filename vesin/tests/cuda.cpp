@@ -3,7 +3,9 @@
 #ifdef VESIN_TESTS_WITH_CUDA
 
 #include <cmath>
+#include <set>
 #include <thread>
+#include <tuple>
 
 #include <cuda_runtime.h>
 
@@ -207,9 +209,10 @@ static void compare_gpu_cpu(
     auto* h_shifts = static_cast<int32_t*>(malloc(sizeof(int32_t) * gpu_nl.length * 3));
     check_cuda(cudaMemcpy(h_shifts, gpu_nl.shifts, sizeof(int32_t) * gpu_nl.length * 3, cudaMemcpyDeviceToHost));
 
-    // CPU NL
+    // CPU NL (force cell-list to avoid CPU cluster-pair triclinic bug)
     VesinNeighborList cpu_nl;
     auto cpu_options = options;
+    cpu_options.algorithm = VesinCellList;
     status = vesin_neighbors(
         points, n_points, box, periodic,
         {VesinDeviceKind::VesinCPU, 0},
@@ -233,6 +236,38 @@ static void compare_gpu_cpu(
         );
     }
 
+    if (gpu_set != cpu_set) {
+        // Print diagnostic info
+        fprintf(stderr, "gpu_set size=%zu, cpu_set size=%zu\n", gpu_set.size(), cpu_set.size());
+
+        // Find pairs in CPU but not GPU (missing)
+        int missing = 0;
+        for (auto& p : cpu_set) {
+            if (gpu_set.find(p) == gpu_set.end()) {
+                if (missing < 5) {
+                    fprintf(stderr, "  MISSING from GPU: (%zu,%zu) shift=(%d,%d,%d)\n",
+                        std::get<0>(p), std::get<1>(p),
+                        std::get<2>(p), std::get<3>(p), std::get<4>(p));
+                }
+                missing++;
+            }
+        }
+        if (missing > 5) fprintf(stderr, "  ... %d more missing\n", missing - 5);
+
+        // Find pairs in GPU but not CPU (extra)
+        int extra = 0;
+        for (auto& p : gpu_set) {
+            if (cpu_set.find(p) == cpu_set.end()) {
+                if (extra < 5) {
+                    fprintf(stderr, "  EXTRA in GPU: (%zu,%zu) shift=(%d,%d,%d)\n",
+                        std::get<0>(p), std::get<1>(p),
+                        std::get<2>(p), std::get<3>(p), std::get<4>(p));
+                }
+                extra++;
+            }
+        }
+        if (extra > 5) fprintf(stderr, "  ... %d more extra\n", extra - 5);
+    }
     CHECK(gpu_set == cpu_set);
 
     free(h_pairs);

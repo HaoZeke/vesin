@@ -62,6 +62,7 @@ struct CudaNeighborListExtras {
         size_t max_clusters = 0;
         size_t max_cells = 0;
         int32_t* cluster_atom_indices = nullptr; // [max_clusters * CLUSTER_SIZE_GPU]
+        int32_t* cluster_atom_shifts = nullptr;  // [max_clusters * CLUSTER_SIZE_GPU * 3]
         int32_t* cluster_n_atoms = nullptr;      // [max_clusters]
         float* cluster_bb_lower = nullptr;       // [max_clusters * 3]
         float* cluster_bb_upper = nullptr;       // [max_clusters * 3]
@@ -75,9 +76,12 @@ struct CudaNeighborListExtras {
         int32_t* d_cell_atom_counts = nullptr;   // [max_cells]
         int32_t* d_cell_atom_starts = nullptr;   // [max_cells]
         int32_t* d_cell_scatter_offsets = nullptr;// [max_cells] working copy for scatter
+        int32_t* d_particle_shifts = nullptr;    // [max_points * 3] wrapping shifts
         double* d_sorted_positions = nullptr;    // [max_points * 3]
         int32_t* d_sorted_atom_indices = nullptr;// [max_points]
+        int32_t* d_sorted_shifts = nullptr;      // [max_points * 3] sorted wrapping shifts
         float* d_sorted_frac_z = nullptr;        // [max_points]
+        int32_t* d_cluster_counts = nullptr;     // [max_cells] clusters per cell
         int32_t* d_n_clusters_total = nullptr;   // [1]
         double* d_grid_inv_box = nullptr;        // [9]
         int32_t* d_grid_n_cells = nullptr;       // [3]
