@@ -473,9 +473,9 @@ TEST_CASE("Verlet: correctness over MD-like trajectory") {
     vesin_verlet_free(vl);
 }
 
-TEST_CASE("Verlet: inner list matches full recompute after rebuild") {
-    // After a rebuild + prune_full, the inner list should produce the exact
-    // same pair set as a stateless NL at the model cutoff.
+TEST_CASE("Verlet: exact pair match with stateless after rebuild") {
+    // After a rebuild, the Verlet NL should produce the exact same pair set
+    // as a stateless NL at the model cutoff.
     double points[][3] = {
         {0.0, 0.0, 0.0},
         {1.5, 0.0, 0.0},
@@ -520,7 +520,7 @@ TEST_CASE("Verlet: inner list matches full recompute after rebuild") {
     vesin_verlet_free(vl);
 }
 
-TEST_CASE("Verlet: 50-step MD trajectory with dual-list") {
+TEST_CASE("Verlet: 50-step MD trajectory correctness") {
     // Extended trajectory test: Verlet output must match stateless at each step
     const size_t n = 8;
     double points[n][3] = {
@@ -586,7 +586,7 @@ TEST_CASE("Verlet: 50-step MD trajectory with dual-list") {
     vesin_verlet_free(vl);
 }
 
-TEST_CASE("Verlet: rolling prune catches drifted pairs") {
+TEST_CASE("Verlet: oscillating atoms near cutoff boundary") {
     // Move atoms so that pairs drift in/out of cutoff, verify no pairs are lost
     double points[][3] = {
         {0.0, 0.0, 0.0},
@@ -643,8 +643,8 @@ TEST_CASE("Verlet: rolling prune catches drifted pairs") {
     vesin_verlet_free(vl);
 }
 
-TEST_CASE("Verlet: all pairs beyond cutoff gives empty inner list") {
-    // All atoms are far apart -- inner list should be empty
+TEST_CASE("Verlet: all pairs beyond cutoff gives empty result") {
+    // All atoms are far apart -- no pairs within cutoff
     double points[][3] = {
         {0.0, 0.0, 0.0},
         {5.0, 0.0, 0.0},
@@ -677,9 +677,9 @@ TEST_CASE("Verlet: all pairs beyond cutoff gives empty inner list") {
     vesin_verlet_free(vl);
 }
 
-TEST_CASE("Verlet: tiny skin means all outer pairs are inner") {
-    // With very small skin, cutoff + skin is close to cutoff, so nearly all
-    // outer pairs should also be inner pairs
+TEST_CASE("Verlet: tiny skin gives exact stateless match") {
+    // With very small skin, cutoff + skin is close to cutoff, so the Verlet
+    // result should closely match the stateless result
     double points[][3] = {
         {0.0, 0.0, 0.0},
         {1.0, 0.0, 0.0},
