@@ -473,6 +473,253 @@ TEST_CASE("Verlet: correctness over MD-like trajectory") {
     vesin_verlet_free(vl);
 }
 
+TEST_CASE("Verlet: inner list matches full recompute after rebuild") {
+    // After a rebuild + prune_full, the inner list should produce the exact
+    // same pair set as a stateless NL at the model cutoff.
+    double points[][3] = {
+        {0.0, 0.0, 0.0},
+        {1.5, 0.0, 0.0},
+        {0.0, 1.5, 0.0},
+        {1.5, 1.5, 0.0},
+        {0.5, 0.5, 1.0},
+        {3.0, 0.0, 0.0},
+        {0.0, 3.0, 0.0},
+        {0.0, 0.0, 3.0},
+    };
+    double box[3][3] = {{10, 0, 0}, {0, 10, 0}, {0, 0, 10}};
+    bool periodic[3] = {true, true, true};
+
+    const char* error_message = nullptr;
+    auto* vl = vesin_verlet_new(3.0, 1.0, true, &error_message);
+    REQUIRE(vl != nullptr);
+
+    VesinNeighborList neighbors;
+    auto options = VesinOptions();
+    options.cutoff = 3.0;
+    options.full = true;
+    options.sorted = false;
+    options.algorithm = VesinAutoAlgorithm;
+    options.return_shifts = true;
+    options.return_distances = true;
+    options.return_vectors = true;
+
+    auto status = vesin_verlet_compute(
+        vl, points, 8, box, periodic, options, &neighbors, &error_message
+    );
+    REQUIRE(status == EXIT_SUCCESS);
+    CHECK(vesin_verlet_did_rebuild(vl) == true);
+
+    // The inner list should produce exactly the stateless result
+    auto ref = stateless_neighbors(points, 8, box, periodic, 3.0, true);
+    auto verlet_pairs = collect_pairs(neighbors);
+    auto ref_pairs = collect_pairs(ref);
+    CHECK(verlet_pairs == ref_pairs);
+
+    vesin_free(&neighbors);
+    vesin_free(&ref);
+    vesin_verlet_free(vl);
+}
+
+TEST_CASE("Verlet: 50-step MD trajectory with dual-list") {
+    // Extended trajectory test: Verlet output must match stateless at each step
+    const size_t n = 8;
+    double points[n][3] = {
+        {0.0, 0.0, 0.0}, {1.5, 0.0, 0.0},
+        {0.0, 1.5, 0.0}, {1.5, 1.5, 0.0},
+        {0.5, 0.5, 1.0}, {3.0, 0.0, 0.0},
+        {0.0, 3.0, 0.0}, {0.0, 0.0, 3.0},
+    };
+    double box[3][3] = {{8, 0, 0}, {0, 8, 0}, {0, 0, 8}};
+    bool periodic[3] = {true, true, true};
+
+    const char* error_message = nullptr;
+    auto* vl = vesin_verlet_new(3.0, 0.5, true, &error_message);
+    REQUIRE(vl != nullptr);
+
+    VesinNeighborList neighbors;
+    auto options = VesinOptions();
+    options.cutoff = 3.0;
+    options.full = true;
+    options.sorted = false;
+    options.algorithm = VesinAutoAlgorithm;
+    options.return_shifts = true;
+    options.return_distances = true;
+    options.return_vectors = true;
+
+    int rebuild_count = 0;
+    const int n_steps = 50;
+
+    for (int step = 0; step < n_steps; step++) {
+        auto status = vesin_verlet_compute(
+            vl, points, n, box, periodic, options, &neighbors, &error_message
+        );
+        REQUIRE(status == EXIT_SUCCESS);
+
+        if (vesin_verlet_did_rebuild(vl)) {
+            rebuild_count++;
+        }
+
+        // All pairs within cutoff must be present
+        auto ref = stateless_neighbors(points, n, box, periodic, 3.0, true);
+        auto verlet_pairs = collect_pairs(neighbors);
+        auto ref_pairs = collect_pairs(ref);
+        for (auto& p : ref_pairs) {
+            REQUIRE(verlet_pairs.count(p) == 1);
+        }
+        vesin_free(&ref);
+
+        // Small deterministic perturbation
+        for (size_t i = 0; i < n; i++) {
+            double dx = 0.02 * std::sin(step * 1.1 + i * 0.7);
+            double dy = 0.02 * std::sin(step * 1.3 + i * 0.9);
+            double dz = 0.02 * std::sin(step * 1.7 + i * 1.1);
+            points[i][0] += dx;
+            points[i][1] += dy;
+            points[i][2] += dz;
+        }
+    }
+
+    CHECK(rebuild_count >= 1);
+    CHECK(rebuild_count < n_steps);
+
+    vesin_free(&neighbors);
+    vesin_verlet_free(vl);
+}
+
+TEST_CASE("Verlet: rolling prune catches drifted pairs") {
+    // Move atoms so that pairs drift in/out of cutoff, verify no pairs are lost
+    double points[][3] = {
+        {0.0, 0.0, 0.0},
+        {2.9, 0.0, 0.0},  // close to cutoff boundary
+    };
+    double box[3][3] = {{10, 0, 0}, {0, 10, 0}, {0, 0, 10}};
+    bool periodic[3] = {true, true, true};
+    double skin = 1.0;
+
+    const char* error_message = nullptr;
+    auto* vl = vesin_verlet_new(3.0, skin, true, &error_message);
+    REQUIRE(vl != nullptr);
+
+    VesinNeighborList neighbors;
+    auto options = VesinOptions();
+    options.cutoff = 3.0;
+    options.full = true;
+    options.sorted = false;
+    options.algorithm = VesinAutoAlgorithm;
+    options.return_shifts = true;
+    options.return_distances = true;
+    options.return_vectors = true;
+
+    // First call: rebuild
+    auto status = vesin_verlet_compute(
+        vl, points, 2, box, periodic, options, &neighbors, &error_message
+    );
+    REQUIRE(status == EXIT_SUCCESS);
+
+    // Move atoms back and forth, verifying correctness at each step
+    for (int step = 0; step < 20; step++) {
+        // Oscillate atom 1 between 2.5 and 3.3 (crossing cutoff boundary)
+        double x1 = 2.9 + 0.4 * std::sin(step * 0.5);
+        double moved_points[][3] = {
+            {0.0, 0.0, 0.0},
+            {x1, 0.0, 0.0},
+        };
+
+        status = vesin_verlet_compute(
+            vl, moved_points, 2, box, periodic, options, &neighbors, &error_message
+        );
+        REQUIRE(status == EXIT_SUCCESS);
+
+        auto ref = stateless_neighbors(moved_points, 2, box, periodic, 3.0, true);
+        auto verlet_pairs = collect_pairs(neighbors);
+        auto ref_pairs = collect_pairs(ref);
+        for (auto& p : ref_pairs) {
+            CHECK(verlet_pairs.count(p) == 1);
+        }
+        vesin_free(&ref);
+    }
+
+    vesin_free(&neighbors);
+    vesin_verlet_free(vl);
+}
+
+TEST_CASE("Verlet: all pairs beyond cutoff gives empty inner list") {
+    // All atoms are far apart -- inner list should be empty
+    double points[][3] = {
+        {0.0, 0.0, 0.0},
+        {5.0, 0.0, 0.0},
+        {0.0, 5.0, 0.0},
+    };
+    double box[3][3] = {{20, 0, 0}, {0, 20, 0}, {0, 0, 20}};
+    bool periodic[3] = {true, true, true};
+
+    const char* error_message = nullptr;
+    auto* vl = vesin_verlet_new(3.0, 1.0, true, &error_message);
+    REQUIRE(vl != nullptr);
+
+    VesinNeighborList neighbors;
+    auto options = VesinOptions();
+    options.cutoff = 3.0;
+    options.full = true;
+    options.sorted = false;
+    options.algorithm = VesinAutoAlgorithm;
+    options.return_shifts = true;
+    options.return_distances = false;
+    options.return_vectors = false;
+
+    auto status = vesin_verlet_compute(
+        vl, points, 3, box, periodic, options, &neighbors, &error_message
+    );
+    REQUIRE(status == EXIT_SUCCESS);
+    CHECK(neighbors.length == 0);
+
+    vesin_free(&neighbors);
+    vesin_verlet_free(vl);
+}
+
+TEST_CASE("Verlet: tiny skin means all outer pairs are inner") {
+    // With very small skin, cutoff + skin is close to cutoff, so nearly all
+    // outer pairs should also be inner pairs
+    double points[][3] = {
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {0.0, 1.0, 0.0},
+        {1.0, 1.0, 0.0},
+    };
+    double box[3][3] = {{5, 0, 0}, {0, 5, 0}, {0, 0, 5}};
+    bool periodic[3] = {true, true, true};
+    double tiny_skin = 0.01;
+
+    const char* error_message = nullptr;
+    auto* vl = vesin_verlet_new(3.0, tiny_skin, true, &error_message);
+    REQUIRE(vl != nullptr);
+
+    VesinNeighborList neighbors;
+    auto options = VesinOptions();
+    options.cutoff = 3.0;
+    options.full = true;
+    options.sorted = false;
+    options.algorithm = VesinAutoAlgorithm;
+    options.return_shifts = true;
+    options.return_distances = true;
+    options.return_vectors = true;
+
+    auto status = vesin_verlet_compute(
+        vl, points, 4, box, periodic, options, &neighbors, &error_message
+    );
+    REQUIRE(status == EXIT_SUCCESS);
+
+    // With tiny skin, Verlet result should be very close to stateless
+    auto ref = stateless_neighbors(points, 4, box, periodic, 3.0, true);
+    auto verlet_pairs = collect_pairs(neighbors);
+    auto ref_pairs = collect_pairs(ref);
+    CHECK(verlet_pairs == ref_pairs);
+
+    vesin_free(&neighbors);
+    vesin_free(&ref);
+    vesin_verlet_free(vl);
+}
+
 TEST_CASE("Verlet: half list") {
     double points[][3] = {
         {0.0, 0.0, 0.0},

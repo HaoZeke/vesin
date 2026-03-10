@@ -190,6 +190,224 @@ void vesin::verlet_recompute(
     }
 }
 
+void vesin::verlet_prune_full(
+    VerletState& state,
+    const double (*points)[3],
+    const double box[3][3]
+) {
+    auto matrix = Matrix{{{
+        {{box[0][0], box[0][1], box[0][2]}},
+        {{box[1][0], box[1][1], box[1][2]}},
+        {{box[2][0], box[2][1], box[2][2]}},
+    }}};
+
+    double cutoff_sq = state.cutoff * state.cutoff;
+
+    state.inner_mask.assign(state.n_pairs, 0);
+    state.inner_indices.clear();
+    state.inner_indices.reserve(state.n_pairs);
+
+    for (size_t k = 0; k < state.n_pairs; k++) {
+        size_t i = state.pairs_i[k];
+        size_t j = state.pairs_j[k];
+
+        auto shift = CellShift{{
+            state.shifts[k * 3 + 0],
+            state.shifts[k * 3 + 1],
+            state.shifts[k * 3 + 2],
+        }};
+
+        auto pi = Vector{{points[i][0], points[i][1], points[i][2]}};
+        auto pj = Vector{{points[j][0], points[j][1], points[j][2]}};
+        auto vec = pj - pi + shift.cartesian(matrix);
+        double dist_sq = vec.dot(vec);
+
+        if (dist_sq < cutoff_sq) {
+            state.inner_mask[k] = 1;
+            state.inner_indices.push_back(k);
+        }
+    }
+
+    state.n_inner = state.inner_indices.size();
+    state.inner_dirty = false;
+
+    // Initialize rolling prune state
+    state.prune_cursor = 0;
+    state.prune_chunk_size = std::max(state.n_pairs / 8, static_cast<size_t>(1));
+    state.steps_since_rebuild = 0;
+    state.prune_interval = 4;
+}
+
+void vesin::verlet_recompute_inner(
+    const VerletState& state,
+    const double (*points)[3],
+    const double box[3][3],
+    VesinOptions options,
+    VesinNeighborList& neighbors
+) {
+    auto matrix = Matrix{{{
+        {{box[0][0], box[0][1], box[0][2]}},
+        {{box[1][0], box[1][1], box[1][2]}},
+        {{box[2][0], box[2][1], box[2][2]}},
+    }}};
+
+    double cutoff_sq = state.cutoff * state.cutoff;
+
+    auto growable = cpu::GrowableNeighborList{neighbors, neighbors.length, options};
+    growable.reset();
+
+    // Pass 1: inner pairs (compact indices, high hit rate, good branch prediction)
+    for (size_t m = 0; m < state.n_inner; m++) {
+        size_t k = state.inner_indices[m];
+
+        size_t i = state.pairs_i[k];
+        size_t j = state.pairs_j[k];
+
+        auto shift = CellShift{{
+            state.shifts[k * 3 + 0],
+            state.shifts[k * 3 + 1],
+            state.shifts[k * 3 + 2],
+        }};
+
+        auto pi = Vector{{points[i][0], points[i][1], points[i][2]}};
+        auto pj = Vector{{points[j][0], points[j][1], points[j][2]}};
+        auto vec = pj - pi + shift.cartesian(matrix);
+        double dist_sq = vec.dot(vec);
+
+        if (dist_sq < cutoff_sq) {
+            auto idx = growable.length();
+            growable.set_pair(idx, i, j);
+
+            if (options.return_shifts) {
+                growable.set_shift(idx, shift);
+            }
+
+            if (options.return_distances) {
+                growable.set_distance(idx, std::sqrt(dist_sq));
+            }
+
+            if (options.return_vectors) {
+                growable.set_vector(idx, vec);
+            }
+
+            growable.increment_length();
+        }
+    }
+
+    // Pass 2: outer-only pairs (not in inner list, might have drifted into cutoff)
+    for (size_t k = 0; k < state.n_pairs; k++) {
+        if (state.inner_mask[k]) {
+            continue;
+        }
+
+        size_t i = state.pairs_i[k];
+        size_t j = state.pairs_j[k];
+
+        auto shift = CellShift{{
+            state.shifts[k * 3 + 0],
+            state.shifts[k * 3 + 1],
+            state.shifts[k * 3 + 2],
+        }};
+
+        auto pi = Vector{{points[i][0], points[i][1], points[i][2]}};
+        auto pj = Vector{{points[j][0], points[j][1], points[j][2]}};
+        auto vec = pj - pi + shift.cartesian(matrix);
+        double dist_sq = vec.dot(vec);
+
+        if (dist_sq < cutoff_sq) {
+            auto idx = growable.length();
+            growable.set_pair(idx, i, j);
+
+            if (options.return_shifts) {
+                growable.set_shift(idx, shift);
+            }
+
+            if (options.return_distances) {
+                growable.set_distance(idx, std::sqrt(dist_sq));
+            }
+
+            if (options.return_vectors) {
+                growable.set_vector(idx, vec);
+            }
+
+            growable.increment_length();
+        }
+    }
+
+    if (options.sorted) {
+        growable.sort();
+    }
+}
+
+void vesin::verlet_prune_rolling(
+    VerletState& state,
+    const double (*points)[3],
+    const double box[3][3]
+) {
+    state.steps_since_rebuild++;
+
+    // Only prune every prune_interval steps
+    if (state.steps_since_rebuild % state.prune_interval != 0) {
+        return;
+    }
+
+    auto matrix = Matrix{{{
+        {{box[0][0], box[0][1], box[0][2]}},
+        {{box[1][0], box[1][1], box[1][2]}},
+        {{box[2][0], box[2][1], box[2][2]}},
+    }}};
+
+    double cutoff_sq = state.cutoff * state.cutoff;
+    // Use cutoff + skin/2 as removal threshold to avoid oscillation
+    double removal_cutoff = state.cutoff + state.skin * 0.5;
+    double removal_cutoff_sq = removal_cutoff * removal_cutoff;
+
+    size_t start = state.prune_cursor;
+    size_t end = std::min(start + state.prune_chunk_size, state.n_pairs);
+
+    for (size_t k = start; k < end; k++) {
+        size_t i = state.pairs_i[k];
+        size_t j = state.pairs_j[k];
+
+        auto shift = CellShift{{
+            state.shifts[k * 3 + 0],
+            state.shifts[k * 3 + 1],
+            state.shifts[k * 3 + 2],
+        }};
+
+        auto pi = Vector{{points[i][0], points[i][1], points[i][2]}};
+        auto pj = Vector{{points[j][0], points[j][1], points[j][2]}};
+        auto vec = pj - pi + shift.cartesian(matrix);
+        double dist_sq = vec.dot(vec);
+
+        if (dist_sq < cutoff_sq && state.inner_mask[k] == 0) {
+            // Pair drifted into cutoff range: add to inner list
+            state.inner_mask[k] = 1;
+            state.inner_dirty = true;
+        } else if (dist_sq > removal_cutoff_sq && state.inner_mask[k] == 1) {
+            // Pair drifted beyond relaxed threshold: remove from inner list
+            state.inner_mask[k] = 0;
+            state.inner_dirty = true;
+        }
+    }
+
+    // Advance cursor, wrap around
+    state.prune_cursor = (end >= state.n_pairs) ? 0 : end;
+
+    // Recompact inner_indices from mask if changed
+    if (state.inner_dirty) {
+        state.inner_indices.clear();
+        state.inner_indices.reserve(state.n_pairs);
+        for (size_t k = 0; k < state.n_pairs; k++) {
+            if (state.inner_mask[k]) {
+                state.inner_indices.push_back(k);
+            }
+        }
+        state.n_inner = state.inner_indices.size();
+        state.inner_dirty = false;
+    }
+}
+
 /* ========================================================================== */
 /* Public C API                                                               */
 /* ========================================================================== */
@@ -224,6 +442,12 @@ extern "C" VesinVerletList* vesin_verlet_new(
         vl->state.full_list = full_list;
         vl->state.n_points = 0;
         vl->state.n_pairs = 0;
+        vl->state.n_inner = 0;
+        vl->state.inner_dirty = false;
+        vl->state.prune_cursor = 0;
+        vl->state.prune_chunk_size = 1;
+        vl->state.steps_since_rebuild = 0;
+        vl->state.prune_interval = 4;
         vl->state.did_rebuild_flag = false;
         vl->state.has_cache = false;
         std::memset(vl->state.ref_box, 0, sizeof(vl->state.ref_box));
@@ -284,8 +508,10 @@ extern "C" int vesin_verlet_compute(
     try {
         if (verlet_needs_rebuild(vl->state, points, n_points, box, periodic)) {
             verlet_rebuild(vl->state, points, n_points, box, periodic);
+            verlet_prune_full(vl->state, points, box);
         } else {
             vl->state.did_rebuild_flag = false;
+            verlet_prune_rolling(vl->state, points, box);
         }
 
         // Initialize device if needed
@@ -293,7 +519,7 @@ extern "C" int vesin_verlet_compute(
             neighbors->device = {VesinCPU, 0};
         }
 
-        verlet_recompute(vl->state, points, box, options, *neighbors);
+        verlet_recompute_inner(vl->state, points, box, options, *neighbors);
 
     } catch (const std::bad_alloc&) {
         VERLET_LAST_ERROR = "failed to allocate memory";
