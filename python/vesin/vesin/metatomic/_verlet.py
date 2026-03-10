@@ -8,7 +8,7 @@ from metatomic.torch import NeighborListOptions, System, register_autograd_neigh
 
 import numpy as np
 
-from .._c_api import VesinNeighborList, VesinOptions
+from .._c_api import VesinDevice, VesinNeighborList, VesinOptions, VesinCPU
 from .._c_lib import _get_library
 
 
@@ -113,12 +113,14 @@ class VerletNeighborList:
         options.return_vectors = True
 
         error_message = ctypes.c_char_p()
+        device = VesinDevice(VesinCPU, 0)
         status = self._lib.vesin_verlet_compute(
             self._handle,
             points_ptr,
             points.shape[0],
             box_ptr,
             periodic_ptr,
+            device,
             options,
             ctypes.byref(self._neighbors),
             error_message,

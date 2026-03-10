@@ -17,6 +17,10 @@ struct VesinVerletList {
 // Thread-local error message storage (same pattern as vesin.cpp)
 thread_local std::string VERLET_LAST_ERROR;
 
+// ========================================================================== //
+// CPU Verlet implementation                                                  //
+// ========================================================================== //
+
 bool vesin::verlet_needs_rebuild(
     const VerletState& state,
     const double (*points)[3],
@@ -69,28 +73,22 @@ void vesin::verlet_rebuild(
     const double (*points)[3],
     size_t n_points,
     const double box[3][3],
-    const bool periodic[3]
+    const bool periodic[3],
+    VesinDevice /*device*/
 ) {
-    // Run full spatial search with expanded cutoff
+    // CPU rebuild: run full spatial search with expanded cutoff
     double expanded_cutoff = state.cutoff + state.skin;
 
     auto options = VesinOptions();
     options.cutoff = expanded_cutoff;
     options.full = state.full_list;
     options.sorted = false;
-    options.algorithm = VesinAutoAlgorithm;
+    options.algorithm = VesinCellList;
     options.return_shifts = true;
     options.return_distances = false;
     options.return_vectors = false;
 
-    // Use a temporary neighbor list for the expanded search.
-    // Route through the C API dispatch so the rebuild benefits from
-    // cluster-pair for N >= CLUSTER_PAIR_THRESHOLD (same as stateless).
-    // Force VesinCellList to avoid triclinic cluster-pair edge cases
-    // until the BB shift fix is validated on all box geometries.
     VesinNeighborList tmp_neighbors;
-    options.algorithm = VesinCellList;
-
     const char* rebuild_error = nullptr;
     int status = vesin_neighbors(
         points,
@@ -235,6 +233,7 @@ extern "C" VesinVerletList* vesin_verlet_new(
         vl->state.n_pairs = 0;
         vl->state.did_rebuild_flag = false;
         vl->state.has_cache = false;
+        vl->state.last_device = VesinUnknownDevice;
         std::memset(vl->state.ref_box, 0, sizeof(vl->state.ref_box));
         for (int d = 0; d < 3; d++) {
             vl->state.ref_periodic[d] = false;
@@ -248,6 +247,9 @@ extern "C" VesinVerletList* vesin_verlet_new(
 }
 
 extern "C" void vesin_verlet_free(VesinVerletList* vl) {
+    if (vl != nullptr) {
+        verlet_free_gpu_buffers(vl->state.gpu);
+    }
     delete vl;
 }
 
@@ -257,6 +259,7 @@ extern "C" int vesin_verlet_compute(
     size_t n_points,
     const double box[3][3],
     const bool periodic[3],
+    VesinDevice device,
     VesinOptions options,
     VesinNeighborList* neighbors,
     const char** error_message
@@ -290,19 +293,61 @@ extern "C" int vesin_verlet_compute(
     options.cutoff = vl->state.cutoff;
     options.full = vl->state.full_list;
 
+    // If device changed from last call, invalidate the cache
+    if (vl->state.last_device != VesinUnknownDevice &&
+        vl->state.last_device != device.type) {
+        vl->state.has_cache = false;
+        if (device.type != VesinCUDA) {
+            verlet_free_gpu_buffers(vl->state.gpu);
+        }
+    }
+    vl->state.last_device = device.type;
+
     try {
-        if (verlet_needs_rebuild(vl->state, points, n_points, box, periodic)) {
-            verlet_rebuild(vl->state, points, n_points, box, periodic);
+        if (device.type == VesinCUDA) {
+            // GPU path
+            bool needs_rebuild;
+            if (!vl->state.has_cache) {
+                needs_rebuild = true;
+            } else {
+                needs_rebuild = verlet_needs_rebuild_gpu(
+                    vl->state, points, n_points, box, periodic
+                );
+            }
+
+            if (needs_rebuild) {
+                verlet_rebuild_gpu(
+                    vl->state, points, n_points, box, periodic, device
+                );
+            } else {
+                vl->state.did_rebuild_flag = false;
+            }
+
+            // Initialize device on the output neighbor list if needed
+            if (neighbors->device.type == VesinUnknownDevice) {
+                neighbors->device = device;
+            }
+
+            verlet_ensure_gpu_output(*neighbors, n_points, device, options);
+
+            verlet_recompute_gpu(
+                vl->state, points, box, options, *neighbors
+            );
+
         } else {
-            vl->state.did_rebuild_flag = false;
-        }
+            // CPU path (original)
+            if (verlet_needs_rebuild(vl->state, points, n_points, box, periodic)) {
+                verlet_rebuild(vl->state, points, n_points, box, periodic);
+            } else {
+                vl->state.did_rebuild_flag = false;
+            }
 
-        // Initialize device if needed
-        if (neighbors->device.type == VesinUnknownDevice) {
-            neighbors->device = {VesinCPU, 0};
-        }
+            if (neighbors->device.type == VesinUnknownDevice) {
+                neighbors->device = {VesinCPU, 0};
+            }
 
-        verlet_recompute(vl->state, points, box, options, *neighbors);
+            verlet_recompute(vl->state, points, box, options, *neighbors);
+        }
 
     } catch (const std::bad_alloc&) {
         VERLET_LAST_ERROR = "failed to allocate memory";

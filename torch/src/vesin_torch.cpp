@@ -388,17 +388,22 @@ std::vector<torch::Tensor> VerletNeighborListHolder::compute(
     std::string quantities,
     bool copy
 ) {
-    // Verlet is CPU-only
-    if (!points.device().is_cpu()) {
-        throw std::runtime_error(
-            "Verlet neighbor list is CPU-only, got device " + points.device().str()
-        );
-    }
-
-    validate_inputs(points, box, periodic);
+    auto vesin_device = validate_inputs(points, box, periodic);
     auto flags = parse_quantities(quantities, points.requires_grad(), box.requires_grad());
 
     auto n_points = static_cast<size_t>(points.size(0));
+
+    // Reset vesin data if device changed
+    if (data_->device.type != VesinUnknownDevice && data_->device.type != vesin_device.type) {
+        vesin_free(data_);
+        std::memset(data_, 0, sizeof(VesinNeighborList));
+    }
+
+    // GPU does not support sorted output
+    auto sorted = this->sorted_;
+    if (vesin_device.type == VesinCUDA) {
+        sorted = false;
+    }
 
     // The cutoff and full fields in VesinOptions are ignored by verlet_compute
     // (they come from the VesinVerletList handle). We still need to set sorted
@@ -406,7 +411,7 @@ std::vector<torch::Tensor> VerletNeighborListHolder::compute(
     auto options = VesinOptions{
         /*cutoff=*/0.0,
         /*full=*/false,
-        /*sorted=*/this->sorted_,
+        /*sorted=*/sorted,
         /*algorithm=*/VesinAutoAlgorithm,
         /*return_shifts=*/flags.return_shifts,
         /*return_distances=*/flags.return_distances,
@@ -420,6 +425,7 @@ std::vector<torch::Tensor> VerletNeighborListHolder::compute(
         n_points,
         reinterpret_cast<const double (*)[3]>(box.data_ptr<double>()),
         periodic.data_ptr<bool>(),
+        vesin_device,
         options,
         data_,
         &error_message

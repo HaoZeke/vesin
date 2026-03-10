@@ -52,7 +52,7 @@ int main() {
     for (int step = 0; step < n_steps; step++) {
         int status = vesin_verlet_compute(
             vl, points, N, box, periodic,
-            options, &neighbors, &error_message
+            {VesinCPU, 0}, options, &neighbors, &error_message
         );
         if (status != 0) {
             fprintf(stderr, "Step %d: error: %s\n", step, error_message);

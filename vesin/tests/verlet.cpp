@@ -105,7 +105,7 @@ TEST_CASE("Verlet: first call rebuilds") {
     options.return_vectors = true;
 
     auto status = vesin_verlet_compute(
-        vl, points, 3, box, periodic, options, &neighbors, &error_message
+        vl, points, 3, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -148,7 +148,7 @@ TEST_CASE("Verlet: small movement does not rebuild") {
 
     // First call: must rebuild
     auto status = vesin_verlet_compute(
-        vl, points, 4, box, periodic, options, &neighbors, &error_message
+        vl, points, 4, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -162,7 +162,7 @@ TEST_CASE("Verlet: small movement does not rebuild") {
     };
 
     status = vesin_verlet_compute(
-        vl, points2, 4, box, periodic, options, &neighbors, &error_message
+        vl, points2, 4, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == false);
@@ -208,7 +208,7 @@ TEST_CASE("Verlet: large movement triggers rebuild") {
 
     // First call
     auto status = vesin_verlet_compute(
-        vl, points, 3, box, periodic, options, &neighbors, &error_message
+        vl, points, 3, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -221,7 +221,7 @@ TEST_CASE("Verlet: large movement triggers rebuild") {
     };
 
     status = vesin_verlet_compute(
-        vl, points2, 3, box, periodic, options, &neighbors, &error_message
+        vl, points2, 3, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -254,7 +254,7 @@ TEST_CASE("Verlet: box change triggers rebuild") {
 
     // First call
     auto status = vesin_verlet_compute(
-        vl, points, 2, box, periodic, options, &neighbors, &error_message
+        vl, points, 2, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -262,7 +262,7 @@ TEST_CASE("Verlet: box change triggers rebuild") {
     // Same positions, different box
     double box2[3][3] = {{10.1, 0, 0}, {0, 10, 0}, {0, 0, 10}};
     status = vesin_verlet_compute(
-        vl, points, 2, box2, periodic, options, &neighbors, &error_message
+        vl, points, 2, box2, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -300,14 +300,14 @@ TEST_CASE("Verlet: N change triggers rebuild") {
 
     // First call with 3 atoms
     auto status = vesin_verlet_compute(
-        vl, points3, 3, box, periodic, options, &neighbors, &error_message
+        vl, points3, 3, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
 
     // Second call with 2 atoms -> rebuild
     status = vesin_verlet_compute(
-        vl, points2, 2, box, periodic, options, &neighbors, &error_message
+        vl, points2, 2, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -343,7 +343,7 @@ TEST_CASE("Verlet: repeated calls with same positions do not rebuild") {
 
     // First call: rebuild
     auto status = vesin_verlet_compute(
-        vl, points, 5, box, periodic, options, &neighbors, &error_message
+        vl, points, 5, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -351,7 +351,7 @@ TEST_CASE("Verlet: repeated calls with same positions do not rebuild") {
     // Same positions, 5 more calls: no rebuild
     for (int repeat = 0; repeat < 5; repeat++) {
         status = vesin_verlet_compute(
-            vl, points, 5, box, periodic, options, &neighbors, &error_message
+            vl, points, 5, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
         );
         REQUIRE(status == EXIT_SUCCESS);
         CHECK(vesin_verlet_did_rebuild(vl) == false);
@@ -387,7 +387,7 @@ TEST_CASE("Verlet: non-periodic system") {
     options.return_vectors = false;
 
     auto status = vesin_verlet_compute(
-        vl, points, 5, box, periodic, options, &neighbors, &error_message
+        vl, points, 5, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 
@@ -436,7 +436,7 @@ TEST_CASE("Verlet: correctness over MD-like trajectory") {
 
     for (int step = 0; step < n_steps; step++) {
         auto status = vesin_verlet_compute(
-            vl, points, n, box, periodic, options, &neighbors, &error_message
+            vl, points, n, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
         );
         REQUIRE(status == EXIT_SUCCESS);
 
@@ -504,7 +504,7 @@ TEST_CASE("Verlet: exact pair match with stateless after rebuild") {
     options.return_vectors = true;
 
     auto status = vesin_verlet_compute(
-        vl, points, 8, box, periodic, options, &neighbors, &error_message
+        vl, points, 8, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(vesin_verlet_did_rebuild(vl) == true);
@@ -551,7 +551,7 @@ TEST_CASE("Verlet: 50-step MD trajectory correctness") {
 
     for (int step = 0; step < n_steps; step++) {
         auto status = vesin_verlet_compute(
-            vl, points, n, box, periodic, options, &neighbors, &error_message
+            vl, points, n, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
         );
         REQUIRE(status == EXIT_SUCCESS);
 
@@ -612,7 +612,7 @@ TEST_CASE("Verlet: oscillating atoms near cutoff boundary") {
 
     // First call: rebuild
     auto status = vesin_verlet_compute(
-        vl, points, 2, box, periodic, options, &neighbors, &error_message
+        vl, points, 2, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 
@@ -626,7 +626,7 @@ TEST_CASE("Verlet: oscillating atoms near cutoff boundary") {
         };
 
         status = vesin_verlet_compute(
-            vl, moved_points, 2, box, periodic, options, &neighbors, &error_message
+            vl, moved_points, 2, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
         );
         REQUIRE(status == EXIT_SUCCESS);
 
@@ -668,7 +668,7 @@ TEST_CASE("Verlet: all pairs beyond cutoff gives empty result") {
     options.return_vectors = false;
 
     auto status = vesin_verlet_compute(
-        vl, points, 3, box, periodic, options, &neighbors, &error_message
+        vl, points, 3, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     CHECK(neighbors.length == 0);
@@ -705,7 +705,7 @@ TEST_CASE("Verlet: tiny skin gives exact stateless match") {
     options.return_vectors = true;
 
     auto status = vesin_verlet_compute(
-        vl, points, 4, box, periodic, options, &neighbors, &error_message
+        vl, points, 4, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 
@@ -744,7 +744,7 @@ TEST_CASE("Verlet: half list") {
     options.return_vectors = true;
 
     auto status = vesin_verlet_compute(
-        vl, points, 3, box, periodic, options, &neighbors, &error_message
+        vl, points, 3, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 

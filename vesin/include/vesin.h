@@ -231,6 +231,7 @@ void VESIN_API vesin_verlet_free(VesinVerletList* vl);
 /// @param n_points Number of points.
 /// @param box 3x3 bounding box matrix (row-major).
 /// @param periodic Array of 3 bools for periodic boundary conditions.
+/// @param device Device where the data lives (CPU or CUDA).
 /// @param options Output options (return_shifts, return_distances,
 ///     return_vectors, sorted). The cutoff and full fields in options are
 ///     ignored (they come from the VesinVerletList handle).
@@ -243,6 +244,7 @@ int VESIN_API vesin_verlet_compute(
     size_t n_points,
     const double box[3][3],
     const bool periodic[3],
+    VesinDevice device,
     struct VesinOptions options,
     struct VesinNeighborList* neighbors,
     const char** error_message

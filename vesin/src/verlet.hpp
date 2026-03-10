@@ -9,6 +9,28 @@
 
 namespace vesin {
 
+/// GPU-side buffers for Verlet caching.
+/// Allocated on demand when device is CUDA.
+struct VerletGpuBuffers {
+    // Reference positions on device [n_points * 3]
+    double* d_ref_positions = nullptr;
+
+    // Cached topology on device
+    size_t* d_pairs_i = nullptr;    // [n_pairs]
+    size_t* d_pairs_j = nullptr;    // [n_pairs]
+    int32_t* d_shifts = nullptr;    // [n_pairs * 3]
+
+    // Rebuild flag [1] on device
+    int* d_rebuild_flag = nullptr;
+
+    // Capacity tracking
+    size_t capacity_points = 0;
+    size_t capacity_pairs = 0;
+
+    // Device ID (-1 = not allocated)
+    int32_t device_id = -1;
+};
+
 /// Internal state for Verlet neighbor list caching.
 ///
 /// Caches the pair topology from a full spatial search (with cutoff + skin)
@@ -39,12 +61,28 @@ struct VerletState {
 
     // Is the cache populated at all?
     bool has_cache;
+
+    // GPU buffers (allocated on demand)
+    VerletGpuBuffers gpu;
+
+    // Which device was last used
+    VesinDeviceKind last_device;
 };
 
 /// Check whether any atom has moved more than skin/2 from its reference
 /// position, or the box/periodicity/N changed. Returns true if a rebuild
 /// is needed.
 bool verlet_needs_rebuild(
+    const VerletState& state,
+    const double (*points)[3],
+    size_t n_points,
+    const double box[3][3],
+    const bool periodic[3]
+);
+
+/// GPU version of needs_rebuild: runs displacement kernel on device.
+/// points must be a device pointer.
+bool verlet_needs_rebuild_gpu(
     const VerletState& state,
     const double (*points)[3],
     size_t n_points,
@@ -59,7 +97,8 @@ void verlet_rebuild(
     const double (*points)[3],
     size_t n_points,
     const double box[3][3],
-    const bool periodic[3]
+    const bool periodic[3],
+    VesinDevice device = {VesinCPU, 0}
 );
 
 /// Recompute distance vectors from cached topology and current positions.
@@ -71,6 +110,39 @@ void verlet_recompute(
     const double box[3][3],
     VesinOptions options,
     VesinNeighborList& neighbors
+);
+
+/// GPU version of recompute: launches kernel to recompute vectors on device.
+void verlet_recompute_gpu(
+    const VerletState& state,
+    const double (*points)[3],
+    const double box[3][3],
+    VesinOptions options,
+    VesinNeighborList& neighbors
+);
+
+/// Free GPU buffers in VerletState.
+void verlet_free_gpu_buffers(VerletGpuBuffers& gpu);
+
+/// Upload cached topology from CPU vectors to GPU buffers.
+void verlet_upload_topology(VerletState& state);
+
+/// GPU rebuild: run stateless GPU NL, copy topology, upload to GPU buffers.
+void verlet_rebuild_gpu(
+    VerletState& state,
+    const double (*points)[3],
+    size_t n_points,
+    const double box[3][3],
+    const bool periodic[3],
+    VesinDevice device
+);
+
+/// Allocate GPU output buffers for Verlet recompute.
+void verlet_ensure_gpu_output(
+    VesinNeighborList& neighbors,
+    size_t n_points,
+    VesinDevice device,
+    VesinOptions options
 );
 
 } // namespace vesin
