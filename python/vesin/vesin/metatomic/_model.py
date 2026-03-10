@@ -195,7 +195,7 @@ def compute_requested_neighbors_with_skin(
     for option in all_options:
         if skin > 0 and not option.strict:
             # Use Verlet caching
-            cache_key = id(option)
+            cache_key = (option.engine_cutoff(system_length_unit), option.full_list)
             if cache_key not in verlet_cache:
                 verlet_cache[cache_key] = VerletNeighborList(
                     option,

@@ -1,9 +1,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <string>
 
+#include "vesin.h"
 #include "verlet.hpp"
 #include "cpu_cell_list.hpp"
 
@@ -83,22 +83,30 @@ void vesin::verlet_rebuild(
     options.return_distances = false;
     options.return_vectors = false;
 
-    // Use a temporary neighbor list for the expanded search
+    // Use a temporary neighbor list for the expanded search.
+    // Route through the C API dispatch so the rebuild benefits from
+    // cluster-pair for N >= CLUSTER_PAIR_THRESHOLD (same as stateless).
+    // Force VesinCellList to avoid triclinic cluster-pair edge cases
+    // until the BB shift fix is validated on all box geometries.
     VesinNeighborList tmp_neighbors;
+    options.algorithm = VesinCellList;
 
-    auto matrix = Matrix{{{
-        {{box[0][0], box[0][1], box[0][2]}},
-        {{box[1][0], box[1][1], box[1][2]}},
-        {{box[2][0], box[2][1], box[2][2]}},
-    }}};
-
-    cpu::neighbors(
-        reinterpret_cast<const Vector*>(points),
+    const char* rebuild_error = nullptr;
+    int status = vesin_neighbors(
+        points,
         n_points,
-        BoundingBox(matrix, periodic),
+        box,
+        periodic,
+        VesinDevice{VesinCPU, 0},
         options,
-        tmp_neighbors
+        &tmp_neighbors,
+        &rebuild_error
     );
+    if (status != EXIT_SUCCESS) {
+        std::string msg = "verlet_rebuild: ";
+        if (rebuild_error) msg += rebuild_error;
+        throw std::runtime_error(msg);
+    }
 
     // Store topology
     state.n_pairs = tmp_neighbors.length;
@@ -127,7 +135,7 @@ void vesin::verlet_rebuild(
     state.did_rebuild_flag = true;
 
     // Free the temporary NL
-    cpu::free_neighbors(tmp_neighbors);
+    vesin_free(&tmp_neighbors);
 }
 
 void vesin::verlet_recompute(

@@ -1,5 +1,5 @@
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <string>
 
 #include "cluster.hpp"
@@ -7,7 +7,10 @@
 #include "vesin.h"
 #include "vesin_cuda.hpp"
 
-/// Threshold for switching from cell-list to cluster-pair search
+/// Threshold for switching from cell-list to cluster-pair search.
+/// This is an internal auto-dispatch parameter, not exposed in the C API
+/// (VesinAlgorithm only has Auto, BruteForce, CellList). Cluster-pair is
+/// selected automatically when N >= this threshold and algorithm is Auto.
 #define CLUSTER_PAIR_THRESHOLD 64
 
 // used to store dynamically allocated error messages before giving a pointer
@@ -143,10 +146,10 @@ extern "C" void vesin_free(VesinNeighborList* neighbors) {
             throw std::runtime_error("unknown device " + std::to_string(neighbors->device.type) + " when freeing memory");
         }
     } catch (const std::exception& e) {
-        std::cerr << "error in vesin_free: " << e.what() << std::endl;
+        std::fprintf(stderr, "error in vesin_free: %s\n", e.what());
         return;
     } catch (...) {
-        std::cerr << "fatal error in vesin_free, unknown type thrown as exception" << std::endl;
+        std::fprintf(stderr, "fatal error in vesin_free, unknown type thrown as exception\n");
         return;
     }
 

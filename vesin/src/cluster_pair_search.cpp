@@ -74,6 +74,9 @@ ClusterGrid vesin::build_cluster_grid(
         float z_frac;  // fractional z for sorting within cell
     };
 
+    auto cell_matrix = box.matrix();
+    grid.atom_wrap_shifts.resize(n_points);
+
     std::vector<AtomCell> assignments(n_points);
     for (size_t i = 0; i < n_points; i++) {
         auto fractional = box.cartesian_to_fractional(points[i]);
@@ -95,6 +98,8 @@ ClusterGrid vesin::build_cluster_grid(
                 cell_idx[d] = std::clamp(cell_idx[d], 0, grid.n_cells[d] - 1);
             }
         }
+
+        grid.atom_wrap_shifts[i] = shift;
 
         int32_t linear = (grid.n_cells[0] * grid.n_cells[1] * cell_idx[2])
                        + (grid.n_cells[0] * cell_idx[1])
@@ -141,12 +146,14 @@ ClusterGrid vesin::build_cluster_grid(
 
             for (int32_t k = 0; k < cl.n_atoms; k++) {
                 size_t idx = cell_start + offset + k;
-                cl.atom_indices[k] = static_cast<int32_t>(assignments[idx].atom_index);
+                auto atom_idx = assignments[idx].atom_index;
+                cl.atom_indices[k] = static_cast<int32_t>(atom_idx);
 
-                // Update bounding box from atom positions
-                auto& pos = points[assignments[idx].atom_index];
+                // Use wrapped position for BB (subtract wrap_shift)
+                auto wrapped = points[atom_idx]
+                    - grid.atom_wrap_shifts[atom_idx].cartesian(cell_matrix);
                 for (int d = 0; d < 3; d++) {
-                    float p = static_cast<float>(pos[d]);
+                    float p = static_cast<float>(wrapped[d]);
                     cl.bb_lower[d] = std::min(cl.bb_lower[d], p);
                     cl.bb_upper[d] = std::max(cl.bb_upper[d], p);
                 }
@@ -235,22 +242,29 @@ void vesin::cpu::cluster_pair_neighbors(
 
             auto cell_shift_base = CellShift{{sx, sy, sz}};
 
+            // Compute Cartesian shift once per cell-pair for BB test
+            auto shift_cart = cell_shift_base.cartesian(cell_matrix);
+            float shift_f[3] = {
+                static_cast<float>(shift_cart[0]),
+                static_cast<float>(shift_cart[1]),
+                static_cast<float>(shift_cart[2]),
+            };
+
             // Iterate over cluster pairs between these two cells
             for (int32_t ci = ci_start; ci < ci_end; ci++) {
                 const auto& cluster_i = grid.clusters[ci];
                 for (int32_t cj = cj_start; cj < cj_end; cj++) {
                     const auto& cluster_j = grid.clusters[cj];
 
-                    // BB distance test (fast reject)
-                    // Note: BB test uses Cartesian positions which don't
-                    // account for the cell shift, so we skip it when there
-                    // is a non-zero cell shift (periodic images). The BB test
-                    // is still beneficial for same-image cluster pairs.
-                    if (sx == 0 && sy == 0 && sz == 0) {
-                        float bb_dist = bb_distance_sq(cluster_i, cluster_j);
-                        if (bb_dist > cutoff2_f) {
-                            continue;
-                        }
+                    // BB distance test with shift (fast reject for all
+                    // cell pairs, including periodic images). When shift
+                    // is zero, shift_f is {0,0,0} so this is equivalent
+                    // to the unshifted test.
+                    float bb_dist = bb_distance_sq_shifted(
+                        cluster_i, cluster_j, shift_f
+                    );
+                    if (bb_dist > cutoff2_f) {
+                        continue;
                     }
 
                     // Expand to atom pairs
@@ -259,7 +273,12 @@ void vesin::cpu::cluster_pair_neighbors(
                         for (int32_t aj = 0; aj < cluster_j.n_atoms; aj++) {
                             size_t idx_j = cluster_j.atom_indices[aj];
 
-                            auto shift = cell_shift_base;
+                            // Correct shift for atom wrapping (same
+                            // convention as cell-list: shift = cell_shift
+                            // + wrap_i - wrap_j).
+                            auto shift = cell_shift_base
+                                + grid.atom_wrap_shifts[idx_i]
+                                - grid.atom_wrap_shifts[idx_j];
                             bool shift_is_zero = shift[0] == 0 && shift[1] == 0 && shift[2] == 0;
 
                             if (idx_i == idx_j && shift_is_zero) {

@@ -210,6 +210,94 @@ TEST_CASE("Cluster-pair: distances match cell-list") {
     vesin_free(&auto_nl);
 }
 
+TEST_CASE("Cluster-pair: triclinic box") {
+    // Triclinic box with 64 atoms -- exercises the shifted BB test
+    // for periodic images where cell_shift != (0,0,0).
+    auto points = cubic_lattice(4, 1.2); // 64 atoms
+    REQUIRE(points.size() == 64);
+
+    // Triclinic box: off-diagonal elements create non-trivial periodic shifts
+    double box[3][3] = {{4.8, 0.0, 0.0}, {1.2, 4.8, 0.0}, {0.8, 0.6, 4.8}};
+    bool periodic[3] = {true, true, true};
+    double cutoff = 2.0;
+
+    auto cell_list_nl = compute_with_algorithm(
+        reinterpret_cast<const double(*)[3]>(points.data()),
+        points.size(), box, periodic, cutoff, false, VesinCellList
+    );
+
+    auto auto_nl = compute_with_algorithm(
+        reinterpret_cast<const double(*)[3]>(points.data()),
+        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+    );
+
+    auto cl_pairs = collect_pairs(cell_list_nl);
+    auto auto_pairs = collect_pairs(auto_nl);
+
+    CHECK(cl_pairs.size() == auto_pairs.size());
+    CHECK(cl_pairs == auto_pairs);
+
+    vesin_free(&cell_list_nl);
+    vesin_free(&auto_nl);
+}
+
+TEST_CASE("Cluster-pair: triclinic box full list") {
+    // Same triclinic geometry but with full list
+    auto points = cubic_lattice(4, 1.2);
+    double box[3][3] = {{4.8, 0.0, 0.0}, {1.2, 4.8, 0.0}, {0.8, 0.6, 4.8}};
+    bool periodic[3] = {true, true, true};
+    double cutoff = 2.0;
+
+    auto cell_list_nl = compute_with_algorithm(
+        reinterpret_cast<const double(*)[3]>(points.data()),
+        points.size(), box, periodic, cutoff, true, VesinCellList
+    );
+
+    auto auto_nl = compute_with_algorithm(
+        reinterpret_cast<const double(*)[3]>(points.data()),
+        points.size(), box, periodic, cutoff, true, VesinAutoAlgorithm
+    );
+
+    auto cl_pairs = collect_pairs(cell_list_nl);
+    auto auto_pairs = collect_pairs(auto_nl);
+
+    CHECK(cl_pairs.size() == auto_pairs.size());
+    CHECK(cl_pairs == auto_pairs);
+
+    vesin_free(&cell_list_nl);
+    vesin_free(&auto_nl);
+}
+
+TEST_CASE("Cluster-pair: large periodic system with BB rejection") {
+    // 125 atoms in periodic box. Many pairs come from periodic images,
+    // so this exercises the shifted BB distance test under load.
+    auto points = cubic_lattice(5, 1.0); // 125 atoms
+    double box_len = 5.0;
+    double box[3][3] = {{box_len, 0, 0}, {0, box_len, 0}, {0, 0, box_len}};
+    bool periodic[3] = {true, true, true};
+    double cutoff = 1.8;
+
+    auto cell_list_nl = compute_with_algorithm(
+        reinterpret_cast<const double(*)[3]>(points.data()),
+        points.size(), box, periodic, cutoff, false, VesinCellList
+    );
+
+    auto auto_nl = compute_with_algorithm(
+        reinterpret_cast<const double(*)[3]>(points.data()),
+        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+    );
+
+    auto cl_pairs = collect_pairs(cell_list_nl);
+    auto auto_pairs = collect_pairs(auto_nl);
+
+    CHECK(cl_pairs.size() > 0);
+    CHECK(cl_pairs.size() == auto_pairs.size());
+    CHECK(cl_pairs == auto_pairs);
+
+    vesin_free(&cell_list_nl);
+    vesin_free(&auto_nl);
+}
+
 TEST_CASE("Cluster-pair: larger system 5x5x5") {
     auto points = cubic_lattice(5, 1.2); // 125 atoms
     double box_len = 5 * 1.2;

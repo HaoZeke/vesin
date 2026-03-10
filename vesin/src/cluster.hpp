@@ -33,6 +33,11 @@ struct ClusterGrid {
     // cell_offsets[cell_idx+1] gives the range of cluster indices in
     // the clusters array.
     std::vector<int32_t> cell_offsets; // [n_cells_total + 1], CSR-style
+
+    // Per-atom wrap shift: when an atom's fractional coordinate falls
+    // outside [0, n_cells), it is wrapped into the grid and the integer
+    // shift is recorded here. Indexed by original atom index.
+    std::vector<CellShift> atom_wrap_shifts;
 };
 
 /// Build a cluster grid from atom positions.
@@ -59,6 +64,27 @@ inline float bb_distance_sq(const Cluster& a, const Cluster& b) {
             gap = a.bb_lower[d] - b.bb_upper[d];
         } else if (b.bb_lower[d] > a.bb_upper[d]) {
             gap = b.bb_lower[d] - a.bb_upper[d];
+        }
+        dist_sq += gap * gap;
+    }
+    return dist_sq;
+}
+
+/// Minimum squared distance between two AABBs where cluster_b is shifted
+/// by a Cartesian offset (for periodic images). When shift is zero, this
+/// is equivalent to bb_distance_sq.
+inline float bb_distance_sq_shifted(
+    const Cluster& a, const Cluster& b, const float shift[3]
+) {
+    float dist_sq = 0.0f;
+    for (int d = 0; d < 3; d++) {
+        float b_lo = b.bb_lower[d] + shift[d];
+        float b_hi = b.bb_upper[d] + shift[d];
+        float gap = 0.0f;
+        if (a.bb_lower[d] > b_hi) {
+            gap = a.bb_lower[d] - b_hi;
+        } else if (b_lo > a.bb_upper[d]) {
+            gap = b_lo - a.bb_upper[d];
         }
         dist_sq += gap * gap;
     }
