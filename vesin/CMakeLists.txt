@@ -65,6 +65,7 @@ set(VESIN_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu_cell_list.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vesin_cuda.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/verlet.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/verlet_cuda.cpp
 )
 
 if (BUILD_VESIN_FOR_PYTHON)
@@ -83,6 +84,7 @@ target_include_directories(vesin_objects PUBLIC
 # Generate the CUDA source files for NVRTC compilation
 make_includeable(${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_bruteforce.cu ${CMAKE_CURRENT_BINARY_DIR}/generated/cuda_bruteforce.cu)
 make_includeable(${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_cell_list.cu ${CMAKE_CURRENT_BINARY_DIR}/generated/cuda_cell_list.cu)
+make_includeable(${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_verlet.cu ${CMAKE_CURRENT_BINARY_DIR}/generated/cuda_verlet.cu)
 
 include(FetchContent)
 

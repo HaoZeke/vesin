@@ -130,6 +130,7 @@ struct VESIN_API VesinNeighborList {
         shifts(nullptr),
         distances(nullptr),
         vectors(nullptr),
+        opaque_cuda(nullptr),
         verlet_mode(false) {}
 #endif
 
@@ -154,7 +155,14 @@ struct VESIN_API VesinNeighborList {
 
     /// Private pointer used to hold additional internal data.
     /// When verlet_mode is true, this is a VerletState*.
+    /// When device.type is VesinCUDA and verlet_mode is false,
+    /// this is a CudaNeighborListExtras*.
     void* opaque = nullptr;
+
+    /// Secondary private pointer for GPU extras when in Verlet mode.
+    /// When verlet_mode is true and device is CUDA, this holds the
+    /// CudaNeighborListExtras* (since opaque holds VerletState*).
+    void* opaque_cuda = nullptr;
 
     /// Internal flag indicating Verlet caching is active.
     /// When true, opaque points to VerletState.

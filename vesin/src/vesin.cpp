@@ -79,13 +79,7 @@ extern "C" int vesin_neighbors(
 
     try {
         if (use_verlet) {
-            // Verlet caching path -- CPU only in this PR
-            if (device.type != VesinCPU) {
-                LAST_ERROR = "Verlet caching (skin > 0) is only supported on CPU";
-                *error_message = LAST_ERROR.c_str();
-                return EXIT_FAILURE;
-            }
-
+            // Verlet caching path
             // Create VerletState if not present
             if (neighbors->opaque == nullptr || !neighbors->verlet_mode) {
                 auto* state = new vesin::VerletState();
@@ -97,6 +91,7 @@ extern "C" int vesin_neighbors(
                 state->n_pairs = 0;
                 state->did_rebuild_flag = false;
                 state->has_cache = false;
+                state->last_device = VesinUnknownDevice;
                 std::memset(state->ref_box, 0, sizeof(state->ref_box));
                 for (int d = 0; d < 3; d++) {
                     state->ref_periodic[d] = false;
@@ -107,18 +102,43 @@ extern "C" int vesin_neighbors(
 
             auto* state = static_cast<vesin::VerletState*>(neighbors->opaque);
 
-            // CPU path
-            bool needs_rebuild = vesin::verlet_needs_rebuild(
-                *state, points, n_points, box, periodic
-            );
-
-            if (needs_rebuild) {
-                vesin::verlet_rebuild(*state, points, n_points, box, periodic);
-            } else {
-                state->did_rebuild_flag = false;
+            // Invalidate cache if device changed
+            if (state->last_device != VesinUnknownDevice && state->last_device != device.type) {
+                state->has_cache = false;
+                if (device.type != VesinCUDA) {
+                    vesin::verlet_free_gpu_buffers(state->gpu);
+                }
             }
+            state->last_device = device.type;
 
-            vesin::verlet_recompute(*state, points, box, options, *neighbors);
+            if (device.type == VesinCUDA) {
+                // GPU path
+                bool needs_rebuild = !state->has_cache || vesin::verlet_needs_rebuild_gpu(
+                    *state, points, n_points, box, periodic
+                );
+
+                if (needs_rebuild) {
+                    vesin::verlet_rebuild_gpu(*state, points, n_points, box, periodic, device);
+                } else {
+                    state->did_rebuild_flag = false;
+                }
+
+                vesin::verlet_ensure_gpu_output(*neighbors, n_points, device, options);
+                vesin::verlet_recompute_gpu(*state, points, box, options, *neighbors);
+            } else {
+                // CPU path
+                bool needs_rebuild = vesin::verlet_needs_rebuild(
+                    *state, points, n_points, box, periodic
+                );
+
+                if (needs_rebuild) {
+                    vesin::verlet_rebuild(*state, points, n_points, box, periodic);
+                } else {
+                    state->did_rebuild_flag = false;
+                }
+
+                vesin::verlet_recompute(*state, points, box, options, *neighbors);
+            }
 
         } else {
             // Stateless path (original behavior)
@@ -174,6 +194,7 @@ extern "C" void vesin_free(VesinNeighborList* neighbors) {
         // Free VerletState if present (only when verlet_mode is true)
         if (neighbors->verlet_mode && neighbors->opaque != nullptr) {
             auto* state = static_cast<vesin::VerletState*>(neighbors->opaque);
+            vesin::verlet_free_gpu_buffers(state->gpu);
             delete state;
             neighbors->opaque = nullptr;
         }

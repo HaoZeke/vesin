@@ -254,9 +254,15 @@ CudaNeighborListExtras::~CudaNeighborListExtras() {
 
 vesin::cuda::CudaNeighborListExtras*
 vesin::cuda::get_cuda_extras(VesinNeighborList* neighbors) {
+    if (neighbors->verlet_mode) {
+        // In verlet_mode, opaque is VerletState*; use opaque_cuda for GPU extras
+        if (neighbors->opaque_cuda == nullptr) {
+            neighbors->opaque_cuda = new vesin::cuda::CudaNeighborListExtras();
+        }
+        return static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors->opaque_cuda);
+    }
     if (neighbors->opaque == nullptr) {
         neighbors->opaque = new vesin::cuda::CudaNeighborListExtras();
-        auto* test = static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors->opaque);
     }
     return static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors->opaque);
 }
@@ -325,8 +331,15 @@ void vesin::cuda::free_neighbors(VesinNeighborList& neighbors) {
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaSetDevice(curr_device));
     }
 
-    delete static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors.opaque);
-    neighbors.opaque = nullptr;
+    if (neighbors.verlet_mode) {
+        // In verlet_mode, opaque is VerletState* (owned by vesin_free).
+        // GPU extras are in opaque_cuda.
+        delete static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors.opaque_cuda);
+        neighbors.opaque_cuda = nullptr;
+    } else {
+        delete static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors.opaque);
+        neighbors.opaque = nullptr;
+    }
 }
 
 void checkCuda() {
