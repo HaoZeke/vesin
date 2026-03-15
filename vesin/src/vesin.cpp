@@ -191,21 +191,10 @@ extern "C" void vesin_free(VesinNeighborList* neighbors) {
     }
 
     try {
-        // Free VerletState if present (only when verlet_mode is true)
-        if (neighbors->verlet_mode && neighbors->opaque != nullptr) {
-            auto* state = static_cast<vesin::VerletState*>(neighbors->opaque);
-            vesin::verlet_free_gpu_buffers(state->gpu);
-            delete state;
-            neighbors->opaque = nullptr;
-            // Null out GPU output pointers so that cuda::free_neighbors
-            // (which calls reset -> cudaFree) does not double-free buffers
-            // that were owned by the VerletState's GPU topology cache.
-            neighbors->pairs = nullptr;
-            neighbors->shifts = nullptr;
-            neighbors->distances = nullptr;
-            neighbors->vectors = nullptr;
-        }
-
+        // Free device-side output buffers and extras FIRST, before deleting
+        // VerletState. This ensures cuda::free_neighbors can still access the
+        // CudaNeighborListExtras (in opaque_cuda) and properly cudaFree all
+        // output buffers before we touch the topology cache.
         if (neighbors->device.type == VesinUnknownDevice) {
             // nothing to do
         } else if (neighbors->device.type == VesinCPU) {
@@ -214,6 +203,14 @@ extern "C" void vesin_free(VesinNeighborList* neighbors) {
             vesin::cuda::free_neighbors(*neighbors);
         } else {
             throw std::runtime_error("unknown device " + std::to_string(neighbors->device.type) + " when freeing memory");
+        }
+
+        // Free VerletState if present (topology cache + GPU buffers)
+        if (neighbors->verlet_mode && neighbors->opaque != nullptr) {
+            auto* state = static_cast<vesin::VerletState*>(neighbors->opaque);
+            vesin::verlet_free_gpu_buffers(state->gpu);
+            delete state;
+            neighbors->opaque = nullptr;
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error in vesin_free: %s\n", e.what());
