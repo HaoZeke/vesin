@@ -197,6 +197,13 @@ extern "C" void vesin_free(VesinNeighborList* neighbors) {
             vesin::verlet_free_gpu_buffers(state->gpu);
             delete state;
             neighbors->opaque = nullptr;
+            // Null out GPU output pointers so that cuda::free_neighbors
+            // (which calls reset -> cudaFree) does not double-free buffers
+            // that were owned by the VerletState's GPU topology cache.
+            neighbors->pairs = nullptr;
+            neighbors->shifts = nullptr;
+            neighbors->distances = nullptr;
+            neighbors->vectors = nullptr;
         }
 
         if (neighbors->device.type == VesinUnknownDevice) {
