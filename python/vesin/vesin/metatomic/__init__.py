@@ -30,12 +30,16 @@ if mta_version < (0, 1, 3) or mta_version >= (0, 2, 0):
 from ._model import (  # noqa: E402
     compute_requested_neighbors,
     compute_requested_neighbors_from_options,
+    compute_requested_neighbors_with_skin,
 )
 from ._neighbors import NeighborList  # noqa: E402
+from ._verlet import VerletNeighborList  # noqa: E402
 
 
 __all__ = [
     "NeighborList",
+    "VerletNeighborList",
     "compute_requested_neighbors",
     "compute_requested_neighbors_from_options",
+    "compute_requested_neighbors_with_skin",
 ]

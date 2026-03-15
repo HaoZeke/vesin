@@ -1,5 +1,3 @@
-from typing import List, Union
-
 import torch
 from metatensor.torch import Labels, TensorBlock
 from metatomic.torch import NeighborListOptions, System, register_autograd_neighbors
@@ -9,22 +7,8 @@ from .. import NeighborList as NeighborListNumpy
 
 try:
     from vesin.torch import NeighborList as NeighborListTorch
-
 except ImportError:
-
-    class NeighborListTorch:
-        def __init__(self, cutoff: float, full_list: bool):
-            raise ValueError("torchscript=True requires `vesin-torch` as a dependency")
-
-        def compute(
-            self,
-            points: torch.Tensor,
-            box: torch.Tensor,
-            periodic: Union[bool, torch.Tensor],
-            quantities: str,
-            copy: bool = True,
-        ) -> List[torch.Tensor]:
-            raise ValueError("torchscript=True requires `vesin-torch` as a dependency")
+    NeighborListTorch = None
 
 
 class NeighborList:
@@ -89,15 +73,24 @@ class NeighborList:
         self.length_unit = length_unit
         self.check_consistency = check_consistency
 
-        if torch.jit.is_scripting() or torchscript:
+        cutoff = self.options.engine_cutoff(self.length_unit)
+        full_list = self.options.full_list
+
+        # Prefer vesin-torch when available (handles CPU and GPU transparently).
+        # Fall back to ctypes-based NeighborList only when vesin-torch is not
+        # installed. The torchscript parameter is kept for API compatibility but
+        # is no longer needed for GPU dispatch.
+        if NeighborListTorch is not None or torch.jit.is_scripting() or torchscript:
+            if NeighborListTorch is None:
+                raise ValueError(
+                    "torchscript=True requires `vesin-torch` as a dependency"
+                )
             self._nl = NeighborListTorch(
-                cutoff=self.options.engine_cutoff(self.length_unit),
-                full_list=self.options.full_list,
+                cutoff=cutoff, full_list=full_list,
             )
         else:
             self._nl = NeighborListNumpy(
-                cutoff=self.options.engine_cutoff(self.length_unit),
-                full_list=self.options.full_list,
+                cutoff=cutoff, full_list=full_list,
             )
 
         # cached Labels

@@ -39,6 +39,11 @@ add_library(vesin_torch SHARED src/vesin_torch.cpp)
 target_link_libraries(vesin_torch PRIVATE vesin_objects)
 target_link_libraries(vesin_torch PUBLIC torch)
 
+# Access vesin internal headers (verlet.hpp) for VerletState
+target_include_directories(vesin_torch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vesin/src
+)
+
 target_include_directories(vesin_torch PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
