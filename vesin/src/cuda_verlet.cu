@@ -95,14 +95,13 @@ __global__ void filter_verlet_compact_candidates(
     const double* ri = &positions[i * 3];
     const double* rj = &positions[j * 3];
 
-    double vx = rj[0] - ri[0];
-    double vy = rj[1] - ri[1];
-    double vz = rj[2] - ri[2];
-    if (sx != 0 || sy != 0 || sz != 0) {
-        vx += sx * box[0] + sy * box[3] + sz * box[6];
-        vy += sx * box[1] + sy * box[4] + sz * box[7];
-        vz += sx * box[2] + sy * box[5] + sz * box[8];
-    }
+    double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
+    double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
+    double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
+
+    double vx = rj[0] - ri[0] + shift_x;
+    double vy = rj[1] - ri[1] + shift_y;
+    double vz = rj[2] - ri[2] + shift_z;
     double dist_sq = vx * vx + vy * vy + vz * vz;
 
     if (dist_sq < cutoff2) {
@@ -167,14 +166,13 @@ __global__ void filter_verlet_candidates(
     const double* ri = &positions[i * 3];
     const double* rj = &positions[j * 3];
 
-    double vx = rj[0] - ri[0];
-    double vy = rj[1] - ri[1];
-    double vz = rj[2] - ri[2];
-    if (sx != 0 || sy != 0 || sz != 0) {
-        vx += sx * box[0] + sy * box[3] + sz * box[6];
-        vy += sx * box[1] + sy * box[4] + sz * box[7];
-        vz += sx * box[2] + sy * box[5] + sz * box[8];
-    }
+    double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
+    double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
+    double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
+
+    double vx = rj[0] - ri[0] + shift_x;
+    double vy = rj[1] - ri[1] + shift_y;
+    double vz = rj[2] - ri[2] + shift_z;
     double dist_sq = vx * vx + vy * vy + vz * vz;
 
     if (dist_sq < cutoff2) {
