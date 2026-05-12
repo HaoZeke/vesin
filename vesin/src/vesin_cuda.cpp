@@ -735,6 +735,7 @@ static void compact_verlet_candidate_cache(
     }
 
     ensure_verlet_compact_buffers(extras, candidate_length);
+    extras.verlet_candidate_length = candidate_length;
     GPULITE_CUDART_CALL(cudaMemset(extras.verlet_compact_overflow_flag, 0, sizeof(int32_t)));
 
     auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
