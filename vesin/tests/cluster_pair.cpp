@@ -94,7 +94,7 @@ TEST_CASE("Cluster-pair: correctness vs cell-list on 4x4x4 lattice") {
         VesinCellList
     );
 
-    // Auto (should use cluster-pair for N=64)
+    // Auto uses cell-list below the cluster-pair threshold.
     auto auto_nl = compute_with_algorithm(
         reinterpret_cast<const double (*)[3]>(points.data()),
         points.size(),
