@@ -303,28 +303,16 @@ static void free_verlet_buffers(CudaNeighborListExtras& extras) {
     }
 
     extras.verlet_candidates = VesinNeighborList();
-    GPULITE_CUDART_CALL(cudaFree(extras.verlet_pruned_candidates.pairs));
-    GPULITE_CUDART_CALL(cudaFree(extras.verlet_pruned_candidates.shifts));
-    extras.verlet_pruned_candidates = VesinNeighborList();
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_ref_positions));
-    GPULITE_CUDART_CALL(cudaFree(extras.verlet_prune_ref_positions));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_rebuild_flag));
-    GPULITE_CUDART_CALL(cudaFree(extras.verlet_prune_rebuild_flag));
 
     extras.verlet_ref_positions = nullptr;
-    extras.verlet_prune_ref_positions = nullptr;
     extras.verlet_rebuild_flag = nullptr;
-    extras.verlet_prune_rebuild_flag = nullptr;
     extras.verlet_ref_capacity = 0;
-    extras.verlet_prune_ref_capacity = 0;
-    extras.verlet_pruned_candidate_capacity = 0;
     extras.verlet_n_points = 0;
     extras.verlet_options = VesinOptions();
     extras.verlet_half_skin_sq = 0.0;
-    extras.verlet_prune_skin = 0.0;
-    extras.verlet_prune_half_skin_sq = 0.0;
     extras.verlet_has_cache = false;
-    extras.verlet_has_pruned_cache = false;
 }
 
 CudaNeighborListExtras::~CudaNeighborListExtras() {
@@ -702,41 +690,6 @@ static void ensure_verlet_ref_buffers(CudaNeighborListExtras& extras, size_t n_p
     }
 }
 
-static void ensure_verlet_prune_ref_buffers(CudaNeighborListExtras& extras, size_t n_points) {
-    if (extras.verlet_prune_ref_capacity < n_points) {
-        GPULITE_CUDART_CALL(cudaFree(extras.verlet_prune_ref_positions));
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_prune_ref_positions, sizeof(double) * n_points * 3));
-        extras.verlet_prune_ref_capacity = n_points;
-    }
-
-    if (extras.verlet_prune_rebuild_flag == nullptr) {
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_prune_rebuild_flag, sizeof(int32_t)));
-    }
-}
-
-static void ensure_verlet_pruned_candidate_buffers(
-    CudaNeighborListExtras& extras,
-    size_t capacity,
-    int32_t device_id
-) {
-    if (extras.verlet_pruned_candidate_capacity < capacity) {
-        GPULITE_CUDART_CALL(cudaFree(extras.verlet_pruned_candidates.pairs));
-        GPULITE_CUDART_CALL(cudaFree(extras.verlet_pruned_candidates.shifts));
-
-        extras.verlet_pruned_candidate_capacity = std::max(capacity, static_cast<size_t>(1));
-        extras.verlet_pruned_candidates = VesinNeighborList();
-        extras.verlet_pruned_candidates.device = {VesinCUDA, device_id};
-        GPULITE_CUDART_CALL(cudaMalloc(
-            (void**)&extras.verlet_pruned_candidates.pairs,
-            sizeof(size_t) * extras.verlet_pruned_candidate_capacity * 2
-        ));
-        GPULITE_CUDART_CALL(cudaMalloc(
-            (void**)&extras.verlet_pruned_candidates.shifts,
-            sizeof(int32_t) * extras.verlet_pruned_candidate_capacity * 3
-        ));
-    }
-}
-
 static bool verlet_needs_rebuild(
     CudaNeighborListExtras& extras,
     gpulite::KernelFactory& factory,
@@ -792,51 +745,6 @@ static bool verlet_needs_rebuild(
     return h_rebuild != 0;
 }
 
-static bool verlet_pruned_needs_rebuild(
-    CudaNeighborListExtras& extras,
-    gpulite::KernelFactory& factory,
-    const std::string& cuda_verlet_code,
-    const double* d_positions,
-    size_t n_points
-) {
-    if (!extras.verlet_has_pruned_cache) {
-        return true;
-    }
-
-    GPULITE_CUDART_CALL(cudaMemset(extras.verlet_prune_rebuild_flag, 0, sizeof(int32_t)));
-
-    auto* kernel = factory.create(
-        "check_verlet_displacements",
-        cuda_verlet_code,
-        "cuda_verlet.cu",
-        {"-std=c++17", "-default-device"}
-    );
-
-    size_t threads = 256;
-    size_t blocks = (n_points + threads - 1) / threads;
-    auto* d_ref_positions = extras.verlet_prune_ref_positions;
-    auto* d_rebuild_flag = extras.verlet_prune_rebuild_flag;
-    std::vector<void*> args = {
-        static_cast<void*>(&d_positions),
-        static_cast<void*>(&d_ref_positions),
-        static_cast<void*>(&n_points),
-        static_cast<void*>(&extras.verlet_prune_half_skin_sq),
-        static_cast<void*>(&d_rebuild_flag),
-    };
-    kernel->launch(
-        dim3(std::max(blocks, static_cast<size_t>(1))),
-        dim3(threads),
-        0,
-        nullptr,
-        args,
-        false
-    );
-
-    int32_t h_rebuild = 0;
-    GPULITE_CUDART_CALL(cudaMemcpy(&h_rebuild, d_rebuild_flag, sizeof(int32_t), cudaMemcpyDeviceToHost));
-    return h_rebuild != 0;
-}
-
 static void rebuild_verlet_cache(
     CudaNeighborListExtras& extras,
     const double (*points)[3],
@@ -854,8 +762,6 @@ static void rebuild_verlet_cache(
 
     extras.verlet_candidates = VesinNeighborList();
     extras.verlet_candidates.device = {VesinCUDA, device_id};
-    extras.verlet_pruned_candidates.length = 0;
-    extras.verlet_has_pruned_cache = false;
 
     auto build_options = VesinOptions();
     build_options.cutoff = options.cutoff + options.skin;
@@ -939,34 +845,29 @@ static void ensure_verlet_output_buffers(
     GPULITE_CUDART_CALL(cudaMemset(extras.overflow_flag, 0, sizeof(int32_t)));
 }
 
-static void filter_verlet_candidate_list(
+static void recompute_verlet_neighbors(
     CudaNeighborListExtras& extras,
     gpulite::KernelFactory& factory,
     const std::string& cuda_verlet_code,
+    const std::string& cuda_sort_pairs_code,
     const double* d_positions,
     const double* d_box,
-    const VesinNeighborList& candidates,
-    double cutoff,
-    VesinNeighborList& output,
-    bool return_shifts,
-    bool return_distances,
-    bool return_vectors,
-    size_t max_pairs,
-    const char* overflow_message
+    VesinOptions options,
+    VesinNeighborList& neighbors
 ) {
-    GPULITE_CUDART_CALL(cudaMemset(extras.length_ptr, 0, sizeof(size_t)));
-    GPULITE_CUDART_CALL(cudaMemset(extras.overflow_flag, 0, sizeof(int32_t)));
+    size_t candidate_length = extras.verlet_candidates.length;
+    ensure_verlet_output_buffers(neighbors, extras, extras.verlet_n_points, candidate_length, options);
 
-    size_t candidate_length = candidates.length;
-    auto* d_pair_indices = reinterpret_cast<size_t*>(output.pairs);
-    auto* d_shifts = reinterpret_cast<int32_t*>(output.shifts);
-    auto* d_distances = output.distances;
-    auto* d_vectors = reinterpret_cast<double*>(output.vectors);
+    auto* d_pair_indices = reinterpret_cast<size_t*>(neighbors.pairs);
+    auto* d_shifts = reinterpret_cast<int32_t*>(neighbors.shifts);
+    auto* d_distances = neighbors.distances;
+    auto* d_vectors = reinterpret_cast<double*>(neighbors.vectors);
     auto* d_pair_counter = extras.length_ptr;
     auto* d_overflow_flag = extras.overflow_flag;
+    size_t max_pairs = extras.max_pairs;
 
-    auto* d_candidate_pairs = reinterpret_cast<size_t*>(candidates.pairs);
-    auto* d_candidate_shifts = reinterpret_cast<int32_t*>(candidates.shifts);
+    auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
+    auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
 
     auto* kernel = factory.create(
         "filter_verlet_candidates",
@@ -983,15 +884,15 @@ static void filter_verlet_candidate_list(
         static_cast<void*>(&d_candidate_pairs),
         static_cast<void*>(&d_candidate_shifts),
         static_cast<void*>(&candidate_length),
-        static_cast<void*>(&cutoff),
+        static_cast<void*>(&options.cutoff),
         static_cast<void*>(&d_pair_counter),
         static_cast<void*>(&d_pair_indices),
         static_cast<void*>(&d_shifts),
         static_cast<void*>(&d_distances),
         static_cast<void*>(&d_vectors),
-        static_cast<void*>(&return_shifts),
-        static_cast<void*>(&return_distances),
-        static_cast<void*>(&return_vectors),
+        static_cast<void*>(&options.return_shifts),
+        static_cast<void*>(&options.return_distances),
+        static_cast<void*>(&options.return_vectors),
         static_cast<void*>(&max_pairs),
         static_cast<void*>(&d_overflow_flag),
     };
@@ -1023,102 +924,10 @@ static void filter_verlet_candidate_list(
     ));
 
     if (h_overflow_flag != 0) {
-        throw std::runtime_error(overflow_message);
+        throw std::runtime_error("The CUDA Verlet output exceeds the cached candidate capacity");
     }
 
-    output.length = *extras.pinned_length_ptr;
-}
-
-static void rebuild_verlet_pruned_candidates(
-    CudaNeighborListExtras& extras,
-    gpulite::KernelFactory& factory,
-    const std::string& cuda_verlet_code,
-    const double* d_positions,
-    const double* d_box,
-    VesinOptions options
-) {
-    size_t full_candidate_length = extras.verlet_candidates.length;
-    ensure_verlet_pruned_candidate_buffers(
-        extras,
-        full_candidate_length,
-        extras.verlet_candidates.device.device_id
-    );
-    ensure_verlet_prune_ref_buffers(extras, extras.verlet_n_points);
-
-    extras.verlet_prune_skin = options.skin * 0.5;
-    extras.verlet_prune_half_skin_sq = (extras.verlet_prune_skin / 2.0) * (extras.verlet_prune_skin / 2.0);
-
-    filter_verlet_candidate_list(
-        extras,
-        factory,
-        cuda_verlet_code,
-        d_positions,
-        d_box,
-        extras.verlet_candidates,
-        options.cutoff + extras.verlet_prune_skin,
-        extras.verlet_pruned_candidates,
-        true,
-        false,
-        false,
-        extras.verlet_pruned_candidate_capacity,
-        "The CUDA Verlet pruned candidate output exceeds the full candidate capacity"
-    );
-
-    GPULITE_CUDART_CALL(cudaMemcpy(
-        extras.verlet_prune_ref_positions,
-        d_positions,
-        sizeof(double) * extras.verlet_n_points * 3,
-        cudaMemcpyDeviceToDevice
-    ));
-    extras.verlet_has_pruned_cache = true;
-}
-
-static void recompute_verlet_neighbors(
-    CudaNeighborListExtras& extras,
-    gpulite::KernelFactory& factory,
-    const std::string& cuda_verlet_code,
-    const std::string& cuda_sort_pairs_code,
-    const double* d_positions,
-    const double* d_box,
-    VesinOptions options,
-    VesinNeighborList& neighbors
-) {
-    size_t full_candidate_length = extras.verlet_candidates.length;
-    ensure_verlet_output_buffers(neighbors, extras, extras.verlet_n_points, full_candidate_length, options);
-
-    if (extras.verlet_prune_skin != options.skin * 0.5 ||
-        verlet_pruned_needs_rebuild(extras, factory, cuda_verlet_code, d_positions, extras.verlet_n_points)) {
-        rebuild_verlet_pruned_candidates(
-            extras,
-            factory,
-            cuda_verlet_code,
-            d_positions,
-            d_box,
-            options
-        );
-    }
-
-    filter_verlet_candidate_list(
-        extras,
-        factory,
-        cuda_verlet_code,
-        d_positions,
-        d_box,
-        extras.verlet_pruned_candidates,
-        options.cutoff,
-        neighbors,
-        options.return_shifts,
-        options.return_distances,
-        options.return_vectors,
-        extras.max_pairs,
-        "The CUDA Verlet output exceeds the cached candidate capacity"
-    );
-
-    auto* d_pair_indices = reinterpret_cast<size_t*>(neighbors.pairs);
-    auto* d_shifts = reinterpret_cast<int32_t*>(neighbors.shifts);
-    auto* d_distances = neighbors.distances;
-    auto* d_vectors = reinterpret_cast<double*>(neighbors.vectors);
-
+    neighbors.length = *extras.pinned_length_ptr;
     sort_pairs_if_needed(
         extras,
         factory,
