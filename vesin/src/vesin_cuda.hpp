@@ -1,6 +1,8 @@
 #ifndef VESIN_CUDA_HPP
 #define VESIN_CUDA_HPP
 
+#include <cstdint>
+
 #include "vesin.h"
 
 namespace vesin {
@@ -73,6 +75,12 @@ struct CudaNeighborListExtras {
     // Verlet cache state. Candidates are generated at cutoff + skin and
     // filtered at the exact cutoff while the reference positions remain valid.
     VesinNeighborList verlet_candidates;
+    uint32_t* verlet_compact_candidate_pairs = nullptr;  // [candidate_length * 2]
+    int32_t* verlet_compact_candidate_shifts = nullptr;  // [candidate_length] packed signed 10-bit shifts
+    int32_t* verlet_compact_overflow_flag = nullptr;     // [1]
+    size_t verlet_candidate_length = 0;
+    size_t verlet_compact_candidate_capacity = 0;
+    bool verlet_has_compact_candidates = false;
     double* verlet_ref_positions = nullptr; // [max_points * 3]
     int32_t* verlet_rebuild_flag = nullptr; // [1]
     size_t verlet_ref_capacity = 0;
