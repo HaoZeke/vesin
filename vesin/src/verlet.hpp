@@ -93,6 +93,8 @@ struct VerletState {
     /// The list is kept in normal neighbor-list representation so rebuild and
     /// recompute paths can share storage and filtering logic.
     VesinNeighborList candidates;
+    /// Cartesian shift vector for each materialized candidate pair.
+    std::vector<Vector> candidate_shift_vectors;
 
     /// Cluster grid used by cluster-backed Verlet candidate caches.
     ClusterGrid cluster_grid;
