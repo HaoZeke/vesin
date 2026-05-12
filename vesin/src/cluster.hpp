@@ -2,6 +2,7 @@
 #define VESIN_CLUSTER_HPP
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -15,6 +16,9 @@ namespace vesin {
 /// a 2-iteration inner loop, and degrades gracefully to SSE (2 doubles,
 /// 4 iterations) or AVX-512 (8 doubles, 1 iteration).
 static constexpr int32_t CLUSTER_SIZE_CPU = 8;
+
+/// Minimum atom count where CPU auto-dispatch uses cluster-pair search.
+static constexpr size_t CLUSTER_PAIR_THRESHOLD = 256;
 
 /// A cluster of up to CLUSTER_SIZE_CPU atoms with a bounding box and
 /// SoA position data for SIMD distance calculations.

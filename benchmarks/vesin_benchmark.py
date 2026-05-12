@@ -12,6 +12,7 @@ import argparse
 import csv
 import statistics
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ import numpy as np
 
 FIELDNAMES = [
     "backend",
+    "variant",
     "mode",
     "stage",
     "n_atoms",
@@ -37,26 +39,47 @@ FIELDNAMES = [
     "min_ms_per_step",
 ]
 
+
+@dataclass(frozen=True)
+class BenchmarkCase:
+    backend: str
+    variant: str
+    mode: str
+    algorithm: str
+
+
 SERIES_STYLES = {
-    ("cpu", "stateless"): {
-        "label": "CPU pre-Verlet",
+    ("cpu", "cell_list", "stateless"): {
+        "label": "CPU cell-list pre-Verlet",
         "color": "#4B5563",
         "marker": "o",
         "linestyle": "--",
     },
-    ("cpu", "verlet"): {
-        "label": "CPU post-Verlet",
+    ("cpu", "cell_list", "verlet"): {
+        "label": "CPU cell-list post-Verlet",
         "color": "#0072B2",
         "marker": "s",
         "linestyle": "-",
     },
-    ("gpu", "stateless"): {
+    ("cpu", "simd", "stateless"): {
+        "label": "CPU SIMD pre-Verlet",
+        "color": "#CC79A7",
+        "marker": "P",
+        "linestyle": "--",
+    },
+    ("cpu", "simd", "verlet"): {
+        "label": "CPU SIMD post-Verlet",
+        "color": "#E69F00",
+        "marker": "X",
+        "linestyle": "-",
+    },
+    ("gpu", "cuda", "stateless"): {
         "label": "GPU pre-Verlet",
         "color": "#D55E00",
         "marker": "^",
         "linestyle": "--",
     },
-    ("gpu", "verlet"): {
+    ("gpu", "cuda", "verlet"): {
         "label": "GPU post-Verlet",
         "color": "#009E73",
         "marker": "D",
@@ -169,6 +192,43 @@ def _time_compute(
     return elapsed_ms, int(first.shape[0])
 
 
+def _default_variant(backend: str, algorithm: str) -> str:
+    if backend == "gpu":
+        return "cuda"
+    if algorithm == "auto":
+        return "simd"
+    return algorithm
+
+
+def benchmark_cases_for_backend(
+    backend: str, args: argparse.Namespace
+) -> list[BenchmarkCase]:
+    cases = [
+        BenchmarkCase(
+            backend=backend,
+            variant=_default_variant(backend, args.algorithm),
+            mode=mode,
+            algorithm=args.algorithm,
+        )
+        for mode in ("stateless", "verlet")
+    ]
+
+    if backend == "cpu" and args.include_cpu_simd and args.algorithm != "auto":
+        cases.extend(
+            [
+                BenchmarkCase(
+                    backend="cpu",
+                    variant="simd",
+                    mode=mode,
+                    algorithm="auto",
+                )
+                for mode in ("stateless", "verlet")
+            ]
+        )
+
+    return cases
+
+
 def benchmark_one(
     *,
     backend: str,
@@ -239,28 +299,31 @@ def run_benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
         for backend in args.backends:
             if backend == "gpu" and cp is None:
                 continue
-            for mode in ("stateless", "verlet"):
+            for case in benchmark_cases_for_backend(backend, args):
                 timings, pairs = benchmark_one(
-                    backend=backend,
-                    mode=mode,
+                    backend=case.backend,
+                    mode=case.mode,
                     positions=positions,
                     box=box,
                     displacements=displacements,
                     warmup_displacements=warmup_displacements,
                     cutoff=args.cutoff,
                     skin=args.skin,
-                    algorithm=args.algorithm,
+                    algorithm=case.algorithm,
                     repeats=args.repeats,
                     cp=cp,
                 )
                 row = {
-                    "backend": backend,
-                    "mode": mode,
-                    "stage": "pre_verlet" if mode == "stateless" else "post_verlet",
+                    "backend": case.backend,
+                    "variant": case.variant,
+                    "mode": case.mode,
+                    "stage": "pre_verlet"
+                    if case.mode == "stateless"
+                    else "post_verlet",
                     "n_atoms": n_atoms,
                     "density": args.density,
                     "cutoff": args.cutoff,
-                    "skin": 0.0 if mode == "stateless" else args.skin,
+                    "skin": 0.0 if case.mode == "stateless" else args.skin,
                     "step_sigma": args.step_sigma,
                     "warmup_steps": args.warmup_steps,
                     "steps": args.steps,
@@ -270,7 +333,8 @@ def run_benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
                 }
                 rows.append(row)
                 print(
-                    f"{backend:>3s} {mode:>9s} {n_atoms:7d} atoms "
+                    f"{case.backend:>3s} {case.variant:>9s} {case.mode:>9s} "
+                    f"{n_atoms:7d} atoms "
                     f"{row['median_ms_per_step']:9.3f} ms/step, {pairs} pairs",
                     flush=True,
                 )
@@ -296,10 +360,13 @@ def read_rows(paths: list[Path]) -> list[dict[str, str]]:
 
 def group_plot_series(
     rows: list[dict[str, Any]],
-) -> dict[tuple[str, str], tuple[list[int], list[float], list[float]]]:
-    grouped: dict[tuple[str, str], list[tuple[int, float, float]]] = {}
+) -> dict[tuple[str, str, str], tuple[list[int], list[float], list[float]]]:
+    grouped: dict[tuple[str, str, str], list[tuple[int, float, float]]] = {}
     for row in rows:
-        key = (str(row["backend"]), str(row["mode"]))
+        backend = str(row["backend"])
+        mode = str(row["mode"])
+        variant = str(row.get("variant") or _default_variant(backend, "cell_list"))
+        key = (backend, variant, mode)
         grouped.setdefault(key, []).append(
             (
                 int(row["n_atoms"]),
@@ -332,10 +399,12 @@ def plot_results(rows: list[dict[str, Any]], output: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(8.8, 5.4))
     for key in (
-        ("cpu", "stateless"),
-        ("cpu", "verlet"),
-        ("gpu", "stateless"),
-        ("gpu", "verlet"),
+        ("cpu", "cell_list", "stateless"),
+        ("cpu", "cell_list", "verlet"),
+        ("cpu", "simd", "stateless"),
+        ("cpu", "simd", "verlet"),
+        ("gpu", "cuda", "stateless"),
+        ("gpu", "cuda", "verlet"),
     ):
         if key not in series:
             continue
@@ -401,6 +470,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--seed", type=int, default=20260512)
     run.add_argument(
         "--algorithm", choices=["auto", "brute_force", "cell_list"], default="cell_list"
+    )
+    run.add_argument(
+        "--include-cpu-simd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="measure CPU auto-dispatch as a SIMD cluster-pair variant",
     )
     run.set_defaults(func=run_command)
 

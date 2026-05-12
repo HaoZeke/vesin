@@ -38,7 +38,11 @@ def test_group_plot_series_orders_each_backend_mode_by_size():
 
     series = benchmark.group_plot_series(rows)
 
-    assert series[("gpu", "verlet")] == ([64, 256], [0.2, 0.5], [0.05, 0.1])
+    assert series[("gpu", "cuda", "verlet")] == (
+        [64, 256],
+        [0.2, 0.5],
+        [0.05, 0.1],
+    )
 
 
 def test_default_benchmark_cases_include_cpu_simd_stateless_and_verlet():
