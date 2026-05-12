@@ -1,5 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <vector>
+
+#include "../src/cluster.hpp"
 #include "../src/cpu_cell_list.hpp"
 #include "../src/verlet.hpp"
 
@@ -13,6 +16,37 @@ static vesin::BoundingBox make_box(const double (*points)[3], size_t n_points, c
     auto box = vesin::BoundingBox(box_matrix, periodic);
     box.make_bounding_for(points, n_points);
     return box;
+}
+
+static vesin::BoundingBox make_box(const std::vector<vesin::Vector>& points, const double matrix[3][3], const bool periodic[3]) {
+    auto box_matrix = vesin::Matrix{{{
+        {{matrix[0][0], matrix[0][1], matrix[0][2]}},
+        {{matrix[1][0], matrix[1][1], matrix[1][2]}},
+        {{matrix[2][0], matrix[2][1], matrix[2][2]}},
+    }}};
+
+    auto box = vesin::BoundingBox(box_matrix, periodic);
+    box.make_bounding_for(reinterpret_cast<const double (*)[3]>(points.data()), points.size());
+    return box;
+}
+
+static std::vector<vesin::Vector> lattice_points(size_t edge, double spacing) {
+    auto points = std::vector<vesin::Vector>();
+    points.reserve(edge * edge * edge);
+
+    for (size_t z = 0; z < edge; z++) {
+        for (size_t y = 0; y < edge; y++) {
+            for (size_t x = 0; x < edge; x++) {
+                points.push_back(vesin::Vector{
+                    spacing * static_cast<double>(x),
+                    spacing * static_cast<double>(y),
+                    spacing * static_cast<double>(z),
+                });
+            }
+        }
+    }
+
+    return points;
 }
 
 TEST_CASE("Verlet recompute keeps allocation capacity across shorter output") {
@@ -103,6 +137,39 @@ TEST_CASE("Verlet cache invalidates when candidate algorithm changes") {
     options.algorithm = VesinAutoAlgorithm;
     state.set_options(options);
     CHECK(state.candidate_count() == 0);
+}
+
+TEST_CASE("Auto Verlet cache stores cluster candidates below atom-pair count") {
+    double box_matrix[3][3] = {{0.0}};
+    bool periodic[3] = {false, false, false};
+
+    auto points = lattice_points(8, 0.9);
+    REQUIRE(points.size() >= vesin::CLUSTER_PAIR_THRESHOLD);
+
+    auto options = VesinOptions();
+    options.cutoff = 1.0;
+    options.skin = 0.35;
+    options.full = false;
+    options.sorted = false;
+    options.algorithm = VesinCellList;
+    options.return_shifts = true;
+    options.return_distances = false;
+    options.return_vectors = false;
+
+    auto box = make_box(points, box_matrix, periodic);
+
+    auto cell_state = vesin::cpu::VerletState();
+    cell_state.set_options(options);
+    cell_state.rebuild(points.data(), points.size(), box);
+    auto atom_candidate_count = cell_state.candidate_count();
+    REQUIRE(atom_candidate_count > 0);
+
+    options.algorithm = VesinAutoAlgorithm;
+    auto auto_state = vesin::cpu::VerletState();
+    auto_state.set_options(options);
+    auto_state.rebuild(points.data(), points.size(), box);
+
+    CHECK(auto_state.candidate_count() < atom_candidate_count);
 }
 
 TEST_CASE("Periodic wrapped coordinates use minimum-image distance for rebuild") {
