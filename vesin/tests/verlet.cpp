@@ -72,6 +72,39 @@ TEST_CASE("Verlet recompute keeps allocation capacity across shorter output") {
     vesin_free(&neighbors);
 }
 
+TEST_CASE("Verlet cache invalidates when candidate algorithm changes") {
+    double box[3][3] = {{0.0}};
+    bool periodic[3] = {false, false, false};
+
+    auto options = VesinOptions();
+    options.cutoff = 1.0;
+    options.skin = 0.6;
+    options.full = false;
+    options.sorted = false;
+    options.algorithm = VesinCellList;
+    options.return_shifts = true;
+    options.return_distances = false;
+    options.return_vectors = false;
+
+    double points[][3] = {
+        {0.0, 0.0, 0.0},
+        {0.9, 0.0, 0.0},
+        {1.8, 0.0, 0.0},
+        {2.7, 0.0, 0.0},
+    };
+
+    auto state = vesin::cpu::VerletState();
+    state.set_options(options);
+    auto box_state = make_box(points, 4, box, periodic);
+    state.rebuild(reinterpret_cast<const vesin::Vector*>(points), 4, box_state);
+
+    REQUIRE(state.candidate_count() == 3);
+
+    options.algorithm = VesinAutoAlgorithm;
+    state.set_options(options);
+    CHECK(state.candidate_count() == 0);
+}
+
 TEST_CASE("Periodic wrapped coordinates use minimum-image distance for rebuild") {
     double box_matrix[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
     bool periodic[3] = {true, true, true};
