@@ -851,6 +851,7 @@ static void recompute_verlet_neighbors(
     const std::string& cuda_verlet_code,
     const std::string& cuda_sort_pairs_code,
     const double* d_positions,
+    const double* d_box,
     VesinOptions options,
     VesinNeighborList& neighbors
 ) {
