@@ -1,10 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <vector>
 
 #include "../src/cluster.hpp"
 #include "../src/cpu_cell_list.hpp"
 #include "../src/verlet.hpp"
+
+using namespace Catch::Matchers;
+
+#define CHECK_APPROX_EQUAL(a, b) CHECK_THAT(a, WithinULP(b, 4));
 
 static vesin::BoundingBox make_box(const double (*points)[3], size_t n_points, const double matrix[3][3], const bool periodic[3]) {
     auto box_matrix = vesin::Matrix{{{
@@ -47,6 +52,18 @@ static std::vector<vesin::Vector> lattice_points(size_t edge, double spacing) {
     }
 
     return points;
+}
+
+static std::vector<vesin::Vector> displaced_points(const std::vector<vesin::Vector>& points) {
+    auto displaced = points;
+
+    for (size_t i = 0; i < displaced.size(); i++) {
+        displaced[i][0] += (static_cast<double>(i % 3) - 1.0) * 0.01;
+        displaced[i][1] += (static_cast<double>((i / 3) % 3) - 1.0) * 0.01;
+        displaced[i][2] += (static_cast<double>((i / 9) % 3) - 1.0) * 0.01;
+    }
+
+    return displaced;
 }
 
 TEST_CASE("Verlet recompute keeps allocation capacity across shorter output") {
@@ -170,6 +187,69 @@ TEST_CASE("Auto Verlet cache stores cluster candidates below atom-pair count") {
     auto_state.rebuild(points.data(), points.size(), box);
 
     CHECK(auto_state.candidate_count() < atom_candidate_count);
+}
+
+TEST_CASE("Auto Verlet cluster cache matches exact cell-list output after small displacements") {
+    double box_matrix[3][3] = {{0.0}};
+    bool periodic[3] = {false, false, false};
+
+    auto reference_points = lattice_points(8, 0.9);
+    auto current_points = displaced_points(reference_points);
+
+    auto options = VesinOptions();
+    options.cutoff = 1.0;
+    options.skin = 0.35;
+    options.full = false;
+    options.sorted = true;
+    options.algorithm = VesinAutoAlgorithm;
+    options.return_shifts = true;
+    options.return_distances = true;
+    options.return_vectors = true;
+
+    auto reference_box = make_box(reference_points, box_matrix, periodic);
+    auto current_box = make_box(current_points, box_matrix, periodic);
+
+    auto auto_state = vesin::cpu::VerletState();
+    auto_state.set_options(options);
+    auto_state.rebuild(reference_points.data(), reference_points.size(), reference_box);
+    REQUIRE_FALSE(auto_state.needs_rebuild(current_points.data(), current_points.size(), current_box));
+
+    auto actual = VesinNeighborList();
+    size_t actual_capacity = 0;
+    auto_state.recompute(current_points.data(), current_box, options, actual, actual_capacity);
+
+    auto exact_options = options;
+    exact_options.skin = 0.0;
+    exact_options.algorithm = VesinCellList;
+
+    auto expected = VesinNeighborList();
+    size_t expected_capacity = 0;
+    vesin::cpu::stateless_neighbors(
+        current_points.data(),
+        current_points.size(),
+        make_box(current_points, box_matrix, periodic),
+        exact_options,
+        expected,
+        expected_capacity
+    );
+
+    REQUIRE(actual.length == expected.length);
+    for (size_t k = 0; k < actual.length; k++) {
+        CHECK(actual.pairs[k][0] == expected.pairs[k][0]);
+        CHECK(actual.pairs[k][1] == expected.pairs[k][1]);
+        CHECK(actual.shifts[k][0] == expected.shifts[k][0]);
+        CHECK(actual.shifts[k][1] == expected.shifts[k][1]);
+        CHECK(actual.shifts[k][2] == expected.shifts[k][2]);
+        CHECK_APPROX_EQUAL(actual.distances[k], expected.distances[k]);
+        CHECK_APPROX_EQUAL(actual.vectors[k][0], expected.vectors[k][0]);
+        CHECK_APPROX_EQUAL(actual.vectors[k][1], expected.vectors[k][1]);
+        CHECK_APPROX_EQUAL(actual.vectors[k][2], expected.vectors[k][2]);
+    }
+
+    actual.device = {VesinCPU, 0};
+    expected.device = {VesinCPU, 0};
+    vesin_free(&actual);
+    vesin_free(&expected);
 }
 
 TEST_CASE("Periodic wrapped coordinates use minimum-image distance for rebuild") {
