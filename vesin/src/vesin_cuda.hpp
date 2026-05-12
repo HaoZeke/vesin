@@ -73,6 +73,10 @@ struct CudaNeighborListExtras {
     // Verlet cache state. Candidates are generated at cutoff + skin and
     // filtered at the exact cutoff while the reference positions remain valid.
     VesinNeighborList verlet_candidates;
+    VesinNeighborList verlet_zero_shift_candidates;
+    VesinNeighborList verlet_shifted_candidates;
+    size_t* verlet_split_counts = nullptr; // [2] zero-shift and shifted candidate counts
+    size_t verlet_split_capacity = 0;
     double* verlet_ref_positions = nullptr; // [max_points * 3]
     int32_t* verlet_rebuild_flag = nullptr; // [1]
     size_t verlet_ref_capacity = 0;
@@ -82,6 +86,7 @@ struct CudaNeighborListExtras {
     VesinOptions verlet_options = {};
     double verlet_half_skin_sq = 0.0;
     bool verlet_has_cache = false;
+    bool verlet_has_split_candidates = false;
 
     ~CudaNeighborListExtras();
 };

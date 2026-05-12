@@ -96,3 +96,99 @@ __global__ void filter_verlet_candidates(
         }
     }
 }
+
+__global__ void split_verlet_candidates_by_shift(
+    const size_t* __restrict__ candidate_pairs,
+    const int* __restrict__ candidate_shifts,
+    size_t candidate_length,
+    size_t* zero_shift_pairs,
+    size_t* shifted_pairs,
+    int* shifted_shifts,
+    size_t* counts
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= candidate_length) {
+        return;
+    }
+
+    size_t i = candidate_pairs[idx * 2 + 0];
+    size_t j = candidate_pairs[idx * 2 + 1];
+    int sx = candidate_shifts[idx * 3 + 0];
+    int sy = candidate_shifts[idx * 3 + 1];
+    int sz = candidate_shifts[idx * 3 + 2];
+
+    if (sx == 0 && sy == 0 && sz == 0) {
+        size_t out = atomicAdd_size_t(&counts[0], 1);
+        zero_shift_pairs[out * 2 + 0] = i;
+        zero_shift_pairs[out * 2 + 1] = j;
+        return;
+    }
+
+    size_t out = atomicAdd_size_t(&counts[1], 1);
+    shifted_pairs[out * 2 + 0] = i;
+    shifted_pairs[out * 2 + 1] = j;
+    shifted_shifts[out * 3 + 0] = sx;
+    shifted_shifts[out * 3 + 1] = sy;
+    shifted_shifts[out * 3 + 2] = sz;
+}
+
+__global__ void filter_verlet_zero_shift_candidates(
+    const double* __restrict__ positions,
+    const size_t* __restrict__ candidate_pairs,
+    size_t candidate_length,
+    double cutoff,
+    size_t* length,
+    size_t* pair_indices,
+    int* shifts_out,
+    double* distances,
+    double* vectors,
+    bool return_shifts,
+    bool return_distances,
+    bool return_vectors,
+    size_t max_pairs,
+    int* overflow_flag
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= candidate_length) {
+        return;
+    }
+
+    double cutoff2 = cutoff * cutoff;
+    size_t i = candidate_pairs[idx * 2 + 0];
+    size_t j = candidate_pairs[idx * 2 + 1];
+
+    const double* ri = &positions[i * 3];
+    const double* rj = &positions[j * 3];
+
+    double vx = rj[0] - ri[0];
+    double vy = rj[1] - ri[1];
+    double vz = rj[2] - ri[2];
+    double dist_sq = vx * vx + vy * vy + vz * vz;
+
+    if (dist_sq < cutoff2) {
+        size_t out = atomicAdd_size_t(length, 1);
+        if (out >= max_pairs) {
+            atomicExch(overflow_flag, 1);
+            return;
+        }
+
+        pair_indices[out * 2 + 0] = i;
+        pair_indices[out * 2 + 1] = j;
+
+        if (return_shifts) {
+            shifts_out[out * 3 + 0] = 0;
+            shifts_out[out * 3 + 1] = 0;
+            shifts_out[out * 3 + 2] = 0;
+        }
+
+        if (return_distances) {
+            distances[out] = sqrt(dist_sq);
+        }
+
+        if (return_vectors) {
+            vectors[out * 3 + 0] = vx;
+            vectors[out * 3 + 1] = vy;
+            vectors[out * 3 + 2] = vz;
+        }
+    }
+}
