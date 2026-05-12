@@ -763,8 +763,10 @@ static void rebuild_verlet_cache(
     extras.verlet_candidates = VesinNeighborList();
     extras.verlet_candidates.device = {VesinCUDA, device_id};
 
+    double cuda_skin = options.skin * 0.5;
+
     auto build_options = VesinOptions();
-    build_options.cutoff = options.cutoff + options.skin;
+    build_options.cutoff = options.cutoff + cuda_skin;
     build_options.full = options.full;
     build_options.sorted = false;
     build_options.algorithm = VesinCellList;
@@ -794,7 +796,7 @@ static void rebuild_verlet_cache(
     std::memcpy(extras.verlet_ref_periodic, h_periodic, sizeof(bool) * 3);
     extras.verlet_n_points = n_points;
     extras.verlet_options = options;
-    extras.verlet_half_skin_sq = (options.skin / 2.0) * (options.skin / 2.0);
+    extras.verlet_half_skin_sq = (cuda_skin / 2.0) * (cuda_skin / 2.0);
     extras.verlet_has_cache = true;
 }
 
