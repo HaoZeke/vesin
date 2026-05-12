@@ -78,7 +78,6 @@ ClusterGrid vesin::build_cluster_grid(
         float z_frac; // fractional z for sorting within cell
     };
 
-    auto cell_matrix = box.matrix();
     grid.atom_wrap_shifts.resize(n_points);
 
     std::vector<AtomCell> assignments(n_points);
@@ -114,7 +113,7 @@ ClusterGrid vesin::build_cluster_grid(
     // matrix multiply in the inner loop).
     grid.wrapped_positions.resize(n_points);
     for (size_t i = 0; i < n_points; i++) {
-        grid.wrapped_positions[i] = points[i] - grid.atom_wrap_shifts[i].cartesian(cell_matrix);
+        grid.wrapped_positions[i] = points[i] - grid.atom_wrap_shifts[i].cartesian(box);
     }
 
     // Count atoms per cell
@@ -274,7 +273,6 @@ void vesin::cpu::cluster_pair_neighbors(
 ) {
     auto grid = build_cluster_grid(points, n_points, cell, options.cutoff);
 
-    auto cell_matrix = cell.matrix();
     auto cutoff2 = options.cutoff * options.cutoff;
     float cutoff2_f = static_cast<float>(cutoff2);
 
@@ -348,7 +346,7 @@ void vesin::cpu::cluster_pair_neighbors(
                             // already have wrap_shift removed, the cell_shift_base
                             // Cartesian offset is the only shift needed for the
                             // vector calculation.
-                            auto shift_cart = cell_shift_base.cartesian(cell_matrix);
+                            auto shift_cart = cell_shift_base.cartesian(cell);
                             float shift_f[3] = {
                                 static_cast<float>(shift_cart[0]),
                                 static_cast<float>(shift_cart[1]),
@@ -433,7 +431,7 @@ void vesin::cpu::cluster_pair_neighbors(
                                             // vector and distance2 using wrapped
                                             // positions + cell shift. These are
                                             // numerically identical to
-                                            //   points[j] - points[i] + shift.cartesian(cell_matrix)
+                                            //   points[j] - points[i] + shift.cartesian(cell)
                                             // because wrapped[k] = points[k] - wrap[k].cart(M)
                                             // and shift = cell_shift + wrap_i - wrap_j.
                                             auto distance2 = tmp_dist2[aj];

@@ -50,8 +50,8 @@ struct ClusterGrid {
     std::vector<CellShift> atom_wrap_shifts;
 
     // Precomputed wrapped positions for all atoms: points[i] minus
-    // wrap_shift[i].cartesian(cell_matrix). Indexed by original atom
-    // index. Used to avoid per-pair matrix multiply in the inner loop.
+    // wrap_shift[i].cartesian(box). Indexed by original atom index.
+    // Used to avoid per-pair matrix multiply in the inner loop.
     std::vector<Vector> wrapped_positions;
 };
 
