@@ -12,9 +12,8 @@ import argparse
 import csv
 import statistics
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -40,8 +39,7 @@ FIELDNAMES = [
 ]
 
 
-@dataclass(frozen=True)
-class BenchmarkCase:
+class BenchmarkCase(NamedTuple):
     backend: str
     variant: str
     mode: str
