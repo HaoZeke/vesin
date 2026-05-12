@@ -41,6 +41,10 @@ const unsigned char CUDA_SORT_PAIRS_CODE[] = {
 #include "generated/cuda_sort_pairs.cu.inc"
 };
 
+const unsigned char CUDA_VERLET_CODE[] = {
+#include "generated/cuda_verlet.cu.inc"
+};
+
 // Maximum number of cells (limited by single-block prefix sum)
 static constexpr size_t DEFAULT_MAX_CELLS = 8192;
 // Minimum particles per cell target for good GPU utilization.
@@ -293,6 +297,24 @@ static void ensure_sort_buffers(
     }
 }
 
+static void free_verlet_buffers(CudaNeighborListExtras& extras) {
+    if (extras.verlet_candidates.device.type == VesinCUDA) {
+        free_neighbors(extras.verlet_candidates);
+    }
+
+    extras.verlet_candidates = VesinNeighborList();
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_ref_positions));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_rebuild_flag));
+
+    extras.verlet_ref_positions = nullptr;
+    extras.verlet_rebuild_flag = nullptr;
+    extras.verlet_ref_capacity = 0;
+    extras.verlet_n_points = 0;
+    extras.verlet_options = VesinOptions();
+    extras.verlet_half_skin_sq = 0.0;
+    extras.verlet_has_cache = false;
+}
+
 CudaNeighborListExtras::~CudaNeighborListExtras() {
     if (this->length_ptr != nullptr) {
         gpulite::CUDART::instance().cudaFree(this->length_ptr);
@@ -312,6 +334,7 @@ CudaNeighborListExtras::~CudaNeighborListExtras() {
     try {
         free_cell_list_buffers(this->cell_list);
         free_sort_buffers(*this);
+        free_verlet_buffers(*this);
     } catch (const std::runtime_error& e) {
         std::cerr << "Error freeing CUDA buffers: " << e.what() << std::endl;
     }
@@ -326,9 +349,7 @@ vesin::cuda::get_cuda_extras(VesinNeighborList* neighbors) {
     return static_cast<vesin::cuda::CudaNeighborListExtras*>(neighbors->opaque);
 }
 
-static void reset(VesinNeighborList& neighbors) {
-    auto* extras = vesin::cuda::get_cuda_extras(&neighbors);
-
+static void free_output_buffers(VesinNeighborList& neighbors, CudaNeighborListExtras& extras) {
     if ((neighbors.pairs != nullptr) && is_device_ptr(getPtrAttributes(neighbors.pairs), "pairs")) {
         GPULITE_CUDART_CALL(cudaFree(neighbors.pairs));
     }
@@ -346,26 +367,39 @@ static void reset(VesinNeighborList& neighbors) {
     neighbors.shifts = nullptr;
     neighbors.distances = nullptr;
     neighbors.vectors = nullptr;
-    extras->length_ptr = nullptr;
 
-    // Free pinned memory if allocated
-    if (extras->pinned_length_ptr != nullptr) {
-        GPULITE_CUDART_CALL(cudaFreeHost(extras->pinned_length_ptr));
-        extras->pinned_length_ptr = nullptr;
+    GPULITE_CUDART_CALL(cudaFree(extras.length_ptr));
+    extras.length_ptr = nullptr;
+
+    if (extras.pinned_length_ptr != nullptr) {
+        GPULITE_CUDART_CALL(cudaFreeHost(extras.pinned_length_ptr));
+        extras.pinned_length_ptr = nullptr;
     }
 
-    // Free brute force buffers
-    GPULITE_CUDART_CALL(cudaFree(extras->box_diag));
-    extras->box_diag = nullptr;
+    GPULITE_CUDART_CALL(cudaFree(extras.cell_check_ptr));
+    extras.cell_check_ptr = nullptr;
 
-    GPULITE_CUDART_CALL(cudaFree(extras->inv_box_brute));
-    extras->inv_box_brute = nullptr;
+    GPULITE_CUDART_CALL(cudaFree(extras.box_diag));
+    extras.box_diag = nullptr;
 
-    GPULITE_CUDART_CALL(cudaFree(extras->overflow_flag));
-    extras->overflow_flag = nullptr;
+    GPULITE_CUDART_CALL(cudaFree(extras.inv_box_brute));
+    extras.inv_box_brute = nullptr;
 
-    free_cell_list_buffers(extras->cell_list);
-    free_sort_buffers(*extras);
+    GPULITE_CUDART_CALL(cudaFree(extras.overflow_flag));
+    extras.overflow_flag = nullptr;
+
+    free_cell_list_buffers(extras.cell_list);
+    free_sort_buffers(extras);
+
+    extras.capacity = 0;
+    extras.max_pairs = 0;
+}
+
+static void reset(VesinNeighborList& neighbors) {
+    auto* extras = vesin::cuda::get_cuda_extras(&neighbors);
+
+    free_output_buffers(neighbors, *extras);
+    free_verlet_buffers(*extras);
 
     *extras = CudaNeighborListExtras();
 }
@@ -484,6 +518,138 @@ static void realloc_buffers_if_needed(
         GPULITE_CUDART_CALL(cudaMalloc((void**)&cl.bounding_min, sizeof(double) * 3));
         GPULITE_CUDART_CALL(cudaMalloc((void**)&cl.bounding_max, sizeof(double) * 3));
     }
+}
+
+static void sort_pairs_if_needed(
+    CudaNeighborListExtras& extras,
+    gpulite::KernelFactory& factory,
+    const std::string& cuda_sort_pairs_code,
+    VesinOptions options,
+    VesinNeighborList& neighbors,
+    size_t* d_pair_indices,
+    int32_t* d_shifts,
+    double* d_distances,
+    double* d_vectors
+) {
+    if (!options.sorted || neighbors.length <= 1) {
+        return;
+    }
+
+    NVTX_PUSH("sort_pairs");
+    size_t sort_capacity = next_power_of_two(neighbors.length);
+    ensure_sort_buffers(
+        extras,
+        sort_capacity,
+        options.return_shifts,
+        options.return_distances,
+        options.return_vectors
+    );
+
+    auto* fill_kernel = factory.create(
+        "sort_pairs_fill_buffers",
+        cuda_sort_pairs_code,
+        "cuda_sort_pairs.cu",
+        {"-std=c++17", "-default-device"}
+    );
+
+    auto* bitonic_kernel = factory.create(
+        "sort_pairs_bitonic_step",
+        cuda_sort_pairs_code,
+        "cuda_sort_pairs.cu",
+        {"-std=c++17", "-default-device"}
+    );
+
+    auto* copy_back_kernel = factory.create(
+        "sort_pairs_copy_back",
+        cuda_sort_pairs_code,
+        "cuda_sort_pairs.cu",
+        {"-std=c++17", "-default-device"}
+    );
+
+    auto* d_pairs_tmp = extras.sort_pairs_tmp;
+    auto* d_shifts_tmp = extras.sort_shifts_tmp;
+    auto* d_distances_tmp = extras.sort_distances_tmp;
+    auto* d_vectors_tmp = extras.sort_vectors_tmp;
+
+    const size_t sort_threads = 256;
+    const size_t sort_fill_blocks = (sort_capacity + sort_threads - 1) / sort_threads;
+
+    std::vector<void*> fill_args = {
+        static_cast<void*>(&d_pair_indices),
+        static_cast<void*>(&d_shifts),
+        static_cast<void*>(&d_distances),
+        static_cast<void*>(&d_vectors),
+        static_cast<void*>(&d_pairs_tmp),
+        static_cast<void*>(&d_shifts_tmp),
+        static_cast<void*>(&d_distances_tmp),
+        static_cast<void*>(&d_vectors_tmp),
+        static_cast<void*>(&neighbors.length),
+        static_cast<void*>(&sort_capacity),
+        static_cast<void*>(&options.return_shifts),
+        static_cast<void*>(&options.return_distances),
+        static_cast<void*>(&options.return_vectors),
+    };
+    fill_kernel->launch(
+        dim3(std::max(sort_fill_blocks, static_cast<size_t>(1))),
+        dim3(sort_threads),
+        0,
+        nullptr,
+        fill_args,
+        false
+    );
+
+    for (size_t k = 2; k <= sort_capacity; k <<= 1) {
+        for (size_t j = k >> 1; j > 0; j >>= 1) {
+            std::vector<void*> bitonic_args = {
+                static_cast<void*>(&d_pairs_tmp),
+                static_cast<void*>(&d_shifts_tmp),
+                static_cast<void*>(&d_distances_tmp),
+                static_cast<void*>(&d_vectors_tmp),
+                static_cast<void*>(&sort_capacity),
+                static_cast<void*>(&j),
+                static_cast<void*>(&k),
+                static_cast<void*>(&options.return_shifts),
+                static_cast<void*>(&options.return_distances),
+                static_cast<void*>(&options.return_vectors),
+            };
+            bitonic_kernel->launch(
+                dim3(std::max(sort_fill_blocks, static_cast<size_t>(1))),
+                dim3(sort_threads),
+                0,
+                nullptr,
+                bitonic_args,
+                false
+            );
+        }
+    }
+
+    const size_t copy_blocks = (neighbors.length + sort_threads - 1) / sort_threads;
+    std::vector<void*> copy_back_args = {
+        static_cast<void*>(&d_pair_indices),
+        static_cast<void*>(&d_shifts),
+        static_cast<void*>(&d_distances),
+        static_cast<void*>(&d_vectors),
+        static_cast<void*>(&d_pairs_tmp),
+        static_cast<void*>(&d_shifts_tmp),
+        static_cast<void*>(&d_distances_tmp),
+        static_cast<void*>(&d_vectors_tmp),
+        static_cast<void*>(&neighbors.length),
+        static_cast<void*>(&options.return_shifts),
+        static_cast<void*>(&options.return_distances),
+        static_cast<void*>(&options.return_vectors),
+    };
+    copy_back_kernel->launch(
+        dim3(std::max(copy_blocks, static_cast<size_t>(1))),
+        dim3(sort_threads),
+        0,
+        nullptr,
+        copy_back_args,
+        false
+    );
+
+    GPULITE_CUDART_CALL(cudaDeviceSynchronize());
+
+    NVTX_POP();
 }
 
 void vesin::cuda::neighbors(
@@ -1077,124 +1243,15 @@ void vesin::cuda::neighbors(
 
     NVTX_POP();
 
-    if (options.sorted && neighbors.length > 1) {
-        // sort pairs in parallel using bitonic sort
-        // https://en.wikipedia.org/wiki/Bitonic_sorter
-
-        NVTX_PUSH("sort_pairs");
-        size_t sort_capacity = next_power_of_two(neighbors.length);
-        ensure_sort_buffers(
-            *extras,
-            sort_capacity,
-            options.return_shifts,
-            options.return_distances,
-            options.return_vectors
-        );
-
-        auto* fill_kernel = factory.create(
-            "sort_pairs_fill_buffers",
-            cuda_sort_pairs_code,
-            "cuda_sort_pairs.cu",
-            {"-std=c++17", "-default-device"}
-        );
-
-        auto* bitonic_kernel = factory.create(
-            "sort_pairs_bitonic_step",
-            cuda_sort_pairs_code,
-            "cuda_sort_pairs.cu",
-            {"-std=c++17", "-default-device"}
-        );
-
-        auto* copy_back_kernel = factory.create(
-            "sort_pairs_copy_back",
-            cuda_sort_pairs_code,
-            "cuda_sort_pairs.cu",
-            {"-std=c++17", "-default-device"}
-        );
-
-        auto* d_pairs_tmp = extras->sort_pairs_tmp;
-        auto* d_shifts_tmp = extras->sort_shifts_tmp;
-        auto* d_distances_tmp = extras->sort_distances_tmp;
-        auto* d_vectors_tmp = extras->sort_vectors_tmp;
-
-        const size_t sort_threads = 256;
-        const size_t sort_fill_blocks = (sort_capacity + sort_threads - 1) / sort_threads;
-
-        std::vector<void*> fill_args = {
-            static_cast<void*>(&d_pair_indices),
-            static_cast<void*>(&d_shifts),
-            static_cast<void*>(&d_distances),
-            static_cast<void*>(&d_vectors),
-            static_cast<void*>(&d_pairs_tmp),
-            static_cast<void*>(&d_shifts_tmp),
-            static_cast<void*>(&d_distances_tmp),
-            static_cast<void*>(&d_vectors_tmp),
-            static_cast<void*>(&neighbors.length),
-            static_cast<void*>(&sort_capacity),
-            static_cast<void*>(&options.return_shifts),
-            static_cast<void*>(&options.return_distances),
-            static_cast<void*>(&options.return_vectors),
-        };
-        fill_kernel->launch(
-            dim3(std::max(sort_fill_blocks, static_cast<size_t>(1))),
-            dim3(sort_threads),
-            0,
-            nullptr,
-            fill_args,
-            false
-        );
-
-        for (size_t k = 2; k <= sort_capacity; k <<= 1) {
-            for (size_t j = k >> 1; j > 0; j >>= 1) {
-                std::vector<void*> bitonic_args = {
-                    static_cast<void*>(&d_pairs_tmp),
-                    static_cast<void*>(&d_shifts_tmp),
-                    static_cast<void*>(&d_distances_tmp),
-                    static_cast<void*>(&d_vectors_tmp),
-                    static_cast<void*>(&sort_capacity),
-                    static_cast<void*>(&j),
-                    static_cast<void*>(&k),
-                    static_cast<void*>(&options.return_shifts),
-                    static_cast<void*>(&options.return_distances),
-                    static_cast<void*>(&options.return_vectors),
-                };
-                bitonic_kernel->launch(
-                    dim3(std::max(sort_fill_blocks, static_cast<size_t>(1))),
-                    dim3(sort_threads),
-                    0,
-                    nullptr,
-                    bitonic_args,
-                    false
-                );
-            }
-        }
-
-        const size_t copy_blocks = (neighbors.length + sort_threads - 1) / sort_threads;
-        std::vector<void*> copy_back_args = {
-            static_cast<void*>(&d_pair_indices),
-            static_cast<void*>(&d_shifts),
-            static_cast<void*>(&d_distances),
-            static_cast<void*>(&d_vectors),
-            static_cast<void*>(&d_pairs_tmp),
-            static_cast<void*>(&d_shifts_tmp),
-            static_cast<void*>(&d_distances_tmp),
-            static_cast<void*>(&d_vectors_tmp),
-            static_cast<void*>(&neighbors.length),
-            static_cast<void*>(&options.return_shifts),
-            static_cast<void*>(&options.return_distances),
-            static_cast<void*>(&options.return_vectors),
-        };
-        copy_back_kernel->launch(
-            dim3(std::max(copy_blocks, static_cast<size_t>(1))),
-            dim3(sort_threads),
-            0,
-            nullptr,
-            copy_back_args,
-            false
-        );
-
-        GPULITE_CUDART_CALL(cudaDeviceSynchronize());
-
-        NVTX_POP();
-    }
+    sort_pairs_if_needed(
+        *extras,
+        factory,
+        cuda_sort_pairs_code,
+        options,
+        neighbors,
+        d_pair_indices,
+        d_shifts,
+        d_distances,
+        d_vectors
+    );
 }
