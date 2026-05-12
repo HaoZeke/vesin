@@ -94,3 +94,63 @@ def test_cuda_verlet_matches_cpu_stateless_over_short_trajectory():
             ],
             dtype=cp.float64,
         )
+
+
+def test_cuda_verlet_matches_cpu_with_triclinic_periodic_shifts():
+    box = cp.asarray(
+        [
+            [4.0, 0.0, 0.0],
+            [0.6, 4.2, 0.0],
+            [0.3, 0.4, 4.5],
+        ],
+        dtype=cp.float64,
+    )
+    cpu_box = cp.asnumpy(box)
+    positions = cp.asarray(
+        [
+            [0.10, 0.10, 0.10],
+            [3.85, 0.25, 0.20],
+            [0.25, 3.95, 0.35],
+            [0.30, 0.45, 4.10],
+            [2.10, 2.00, 2.20],
+        ],
+        dtype=cp.float64,
+    )
+
+    gpu_nl = NeighborList(cutoff=1.0, full_list=True, skin=0.35, algorithm="cell_list")
+    cpu_nl = NeighborList(cutoff=1.0, full_list=True, algorithm="cell_list")
+
+    for step in range(4):
+        cpu_positions = cp.asnumpy(positions)
+        cpu_i, cpu_j, cpu_S = cpu_nl.compute(
+            cpu_positions,
+            cpu_box,
+            periodic=True,
+            quantities="ijS",
+        )
+
+        gpu_i, gpu_j, gpu_S = gpu_nl.compute(
+            positions,
+            box,
+            periodic=True,
+            quantities="ijS",
+        )
+
+        assert _neighbors_as_set(
+            cp.asnumpy(gpu_i), cp.asnumpy(gpu_j), gpu_S
+        ) == _neighbors_as_set(
+            cpu_i,
+            cpu_j,
+            cpu_S,
+        )
+
+        positions = positions + cp.asarray(
+            [
+                [0.010 * (step + 1), 0.000, 0.000],
+                [0.000, 0.008 * (step + 1), 0.000],
+                [0.000, 0.000, 0.006 * (step + 1)],
+                [0.004 * (step + 1), 0.004 * (step + 1), 0.000],
+                [0.000, 0.003 * (step + 1), 0.002 * (step + 1)],
+            ],
+            dtype=cp.float64,
+        )
