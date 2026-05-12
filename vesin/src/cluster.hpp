@@ -66,7 +66,7 @@ struct ClusterGrid {
 ClusterGrid build_cluster_grid(
     const Vector* points,
     size_t n_points,
-    BoundingBox box,
+    const BoundingBox& box,
     double cutoff
 );
 
@@ -117,7 +117,7 @@ namespace cpu {
 void cluster_pair_neighbors(
     const Vector* points,
     size_t n_points,
-    BoundingBox cell,
+    const BoundingBox& cell,
     VesinOptions options,
     VesinNeighborList& neighbors
 );

@@ -31,7 +31,7 @@ static std::tuple<int32_t, int32_t> divmod(int32_t a, int32_t b) {
 ClusterGrid vesin::build_cluster_grid(
     const Vector* points,
     size_t n_points,
-    BoundingBox box,
+    const BoundingBox& box,
     double cutoff
 ) {
     ClusterGrid grid;
@@ -268,7 +268,7 @@ static int simd_check_distances(
 void vesin::cpu::cluster_pair_neighbors(
     const Vector* points,
     size_t n_points,
-    BoundingBox cell,
+    const BoundingBox& cell,
     VesinOptions options,
     VesinNeighborList& raw_neighbors
 ) {

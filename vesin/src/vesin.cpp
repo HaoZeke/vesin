@@ -104,7 +104,7 @@ extern "C" int vesin_neighbors(
                 vesin::cpu::neighbors(
                     points_vec,
                     n_points,
-                    bounding_box,
+                    std::move(bounding_box),
                     options,
                     *neighbors
                 );
