@@ -305,12 +305,9 @@ static void free_verlet_buffers(CudaNeighborListExtras& extras) {
     extras.verlet_candidates = VesinNeighborList();
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_ref_positions));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_rebuild_flag));
-    GPULITE_CUDART_CALL(cudaFree(extras.verlet_candidate_shifts));
 
     extras.verlet_ref_positions = nullptr;
     extras.verlet_rebuild_flag = nullptr;
-    extras.verlet_candidate_shifts = nullptr;
-    extras.verlet_candidate_shift_capacity = 0;
     extras.verlet_ref_capacity = 0;
     extras.verlet_n_points = 0;
     extras.verlet_options = VesinOptions();
@@ -693,14 +690,6 @@ static void ensure_verlet_ref_buffers(CudaNeighborListExtras& extras, size_t n_p
     }
 }
 
-static void ensure_verlet_candidate_shift_buffers(CudaNeighborListExtras& extras, size_t candidate_length) {
-    if (extras.verlet_candidate_shift_capacity < candidate_length) {
-        GPULITE_CUDART_CALL(cudaFree(extras.verlet_candidate_shifts));
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_candidate_shifts, sizeof(double) * candidate_length * 3));
-        extras.verlet_candidate_shift_capacity = candidate_length;
-    }
-}
-
 static bool verlet_needs_rebuild(
     CudaNeighborListExtras& extras,
     gpulite::KernelFactory& factory,
@@ -758,8 +747,6 @@ static bool verlet_needs_rebuild(
 
 static void rebuild_verlet_cache(
     CudaNeighborListExtras& extras,
-    gpulite::KernelFactory& factory,
-    const std::string& cuda_verlet_code,
     const double (*points)[3],
     size_t n_points,
     const double box[3][3],
@@ -794,38 +781,6 @@ static void rebuild_verlet_cache(
         build_options,
         extras.verlet_candidates
     );
-
-    size_t candidate_length = extras.verlet_candidates.length;
-    if (candidate_length != 0) {
-        ensure_verlet_candidate_shift_buffers(extras, candidate_length);
-        auto* shift_kernel = factory.create(
-            "cache_verlet_candidate_shifts",
-            cuda_verlet_code,
-            "cuda_verlet.cu",
-            {"-std=c++17", "-default-device"}
-        );
-
-        auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
-        auto* d_box = reinterpret_cast<const double*>(box);
-        auto* d_candidate_shift_vectors = extras.verlet_candidate_shifts;
-
-        size_t threads = 256;
-        size_t blocks = (candidate_length + threads - 1) / threads;
-        std::vector<void*> shift_args = {
-            static_cast<void*>(&d_candidate_shifts),
-            static_cast<void*>(&candidate_length),
-            static_cast<void*>(&d_box),
-            static_cast<void*>(&d_candidate_shift_vectors),
-        };
-        shift_kernel->launch(
-            dim3(std::max(blocks, static_cast<size_t>(1))),
-            dim3(threads),
-            0,
-            nullptr,
-            shift_args,
-            false
-        );
-    }
 
     ensure_verlet_ref_buffers(extras, n_points);
     GPULITE_CUDART_CALL(cudaMemcpy(
@@ -896,6 +851,7 @@ static void recompute_verlet_neighbors(
     const std::string& cuda_verlet_code,
     const std::string& cuda_sort_pairs_code,
     const double* d_positions,
+    const double* d_box,
     VesinOptions options,
     VesinNeighborList& neighbors
 ) {
@@ -912,7 +868,6 @@ static void recompute_verlet_neighbors(
 
     auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
     auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
-    auto* d_candidate_shift_vectors = extras.verlet_candidate_shifts;
 
     auto* kernel = factory.create(
         "filter_verlet_candidates",
@@ -925,9 +880,9 @@ static void recompute_verlet_neighbors(
     size_t blocks = (candidate_length + threads - 1) / threads;
     std::vector<void*> args = {
         static_cast<void*>(&d_positions),
+        static_cast<void*>(&d_box),
         static_cast<void*>(&d_candidate_pairs),
         static_cast<void*>(&d_candidate_shifts),
-        static_cast<void*>(&d_candidate_shift_vectors),
         static_cast<void*>(&candidate_length),
         static_cast<void*>(&options.cutoff),
         static_cast<void*>(&d_pair_counter),
@@ -1071,8 +1026,6 @@ void vesin::cuda::neighbors(
             )) {
             rebuild_verlet_cache(
                 *extras,
-                factory,
-                cuda_verlet_code,
                 points,
                 n_points,
                 box,
@@ -1090,6 +1043,7 @@ void vesin::cuda::neighbors(
             cuda_verlet_code,
             cuda_sort_pairs_code,
             reinterpret_cast<const double*>(points),
+            reinterpret_cast<const double*>(box),
             options,
             neighbors
         );
