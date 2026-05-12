@@ -35,8 +35,7 @@ static PairSet collect_pairs(const VesinNeighborList& nl) {
     PairSet result;
     for (size_t k = 0; k < nl.length; k++) {
         result.emplace(
-            nl.pairs[k][0], nl.pairs[k][1],
-            nl.shifts[k][0], nl.shifts[k][1], nl.shifts[k][2]
+            nl.pairs[k][0], nl.pairs[k][1], nl.shifts[k][0], nl.shifts[k][1], nl.shifts[k][2]
         );
     }
     return result;
@@ -64,8 +63,7 @@ static VesinNeighborList compute_with_algorithm(
     VesinNeighborList neighbors;
     const char* error_message = nullptr;
     auto status = vesin_neighbors(
-        points, n_points, box, periodic,
-        {VesinCPU, 0}, options, &neighbors, &error_message
+        points, n_points, box, periodic, {VesinCPU, 0}, options, &neighbors, &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
     if (error_message != nullptr) {
@@ -87,14 +85,24 @@ TEST_CASE("Cluster-pair: correctness vs cell-list on 4x4x4 lattice") {
 
     // Cell-list (forced)
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     // Auto (should use cluster-pair for N=64)
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -115,13 +123,23 @@ TEST_CASE("Cluster-pair: full list on 4x4x4 lattice") {
     double cutoff = 2.5;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, true, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        true,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, true, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        true,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -141,13 +159,23 @@ TEST_CASE("Cluster-pair: non-periodic system") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -181,18 +209,28 @@ TEST_CASE("Cluster-pair: distances match cell-list") {
 
     options.algorithm = VesinCellList;
     auto status = vesin_neighbors(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic,
-        {VesinCPU, 0}, options, &cl_nl, &error_message
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        {VesinCPU, 0},
+        options,
+        &cl_nl,
+        &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 
     VesinNeighborList auto_nl;
     options.algorithm = VesinAutoAlgorithm;
     status = vesin_neighbors(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic,
-        {VesinCPU, 0}, options, &auto_nl, &error_message
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        {VesinCPU, 0},
+        options,
+        &auto_nl,
+        &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 
@@ -223,13 +261,23 @@ TEST_CASE("Cluster-pair: triclinic box") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -250,13 +298,23 @@ TEST_CASE("Cluster-pair: triclinic box full list") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, true, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        true,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, true, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        true,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -279,13 +337,23 @@ TEST_CASE("Cluster-pair: large periodic system with BB rejection") {
     double cutoff = 1.8;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -307,13 +375,23 @@ TEST_CASE("Cluster-pair: larger system 5x5x5") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -339,13 +417,23 @@ TEST_CASE("Cluster-pair SIMD: 7x7x7 periodic half list") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -367,13 +455,23 @@ TEST_CASE("Cluster-pair SIMD: 7x7x7 periodic full list") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, true, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        true,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, true, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        true,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -394,13 +492,23 @@ TEST_CASE("Cluster-pair SIMD: 7x7x7 non-periodic") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -422,13 +530,23 @@ TEST_CASE("Cluster-pair SIMD: triclinic 7x7x7") {
     double cutoff = 2.0;
 
     auto cell_list_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinCellList
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinCellList
     );
 
     auto auto_nl = compute_with_algorithm(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic, cutoff, false, VesinAutoAlgorithm
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        cutoff,
+        false,
+        VesinAutoAlgorithm
     );
 
     auto cl_pairs = collect_pairs(cell_list_nl);
@@ -462,18 +580,28 @@ TEST_CASE("Cluster-pair SIMD: distances match cell-list 7x7x7") {
 
     options.algorithm = VesinCellList;
     auto status = vesin_neighbors(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic,
-        {VesinCPU, 0}, options, &cl_nl, &error_message
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        {VesinCPU, 0},
+        options,
+        &cl_nl,
+        &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 
     VesinNeighborList auto_nl;
     options.algorithm = VesinAutoAlgorithm;
     status = vesin_neighbors(
-        reinterpret_cast<const double(*)[3]>(points.data()),
-        points.size(), box, periodic,
-        {VesinCPU, 0}, options, &auto_nl, &error_message
+        reinterpret_cast<const double (*)[3]>(points.data()),
+        points.size(),
+        box,
+        periodic,
+        {VesinCPU, 0},
+        options,
+        &auto_nl,
+        &error_message
     );
     REQUIRE(status == EXIT_SUCCESS);
 

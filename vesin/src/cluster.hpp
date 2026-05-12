@@ -6,8 +6,8 @@
 #include <limits>
 #include <vector>
 
-#include "vesin.h"
 #include "types.hpp"
+#include "vesin.h"
 
 namespace vesin {
 
@@ -20,9 +20,9 @@ static constexpr int32_t CLUSTER_SIZE_CPU = 8;
 /// SoA position data for SIMD distance calculations.
 struct Cluster {
     int32_t atom_indices[CLUSTER_SIZE_CPU];
-    int32_t n_atoms;      // actual count (<= CLUSTER_SIZE_CPU)
-    float bb_lower[3];    // bounding box min (float for SIMD efficiency)
-    float bb_upper[3];    // bounding box max
+    int32_t n_atoms;   // actual count (<= CLUSTER_SIZE_CPU)
+    float bb_lower[3]; // bounding box min (float for SIMD efficiency)
+    float bb_upper[3]; // bounding box max
 
     // SoA (Structure of Arrays) wrapped positions for SIMD loads.
     // These store the atom positions after subtracting the wrap shift,
