@@ -25,31 +25,11 @@ __global__ void check_verlet_displacements(
     }
 }
 
-__global__ void cache_verlet_candidate_shifts(
-    const int* __restrict__ candidate_shifts,
-    size_t candidate_length,
-    const double* __restrict__ box,
-    double* __restrict__ candidate_shift_vectors
-) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= candidate_length) {
-        return;
-    }
-
-    int sx = candidate_shifts[idx * 3 + 0];
-    int sy = candidate_shifts[idx * 3 + 1];
-    int sz = candidate_shifts[idx * 3 + 2];
-
-    candidate_shift_vectors[idx * 3 + 0] = sx * box[0] + sy * box[3] + sz * box[6];
-    candidate_shift_vectors[idx * 3 + 1] = sx * box[1] + sy * box[4] + sz * box[7];
-    candidate_shift_vectors[idx * 3 + 2] = sx * box[2] + sy * box[5] + sz * box[8];
-}
-
 __global__ void filter_verlet_candidates(
     const double* __restrict__ positions,
+    const double* __restrict__ box,
     const size_t* __restrict__ candidate_pairs,
     const int* __restrict__ candidate_shifts,
-    const double* __restrict__ candidate_shift_vectors,
     size_t candidate_length,
     double cutoff,
     size_t* length,
@@ -88,9 +68,9 @@ __global__ void filter_verlet_candidates(
         const double* ri = &positions[i * 3];
         const double* rj = &positions[j * 3];
 
-        double shift_x = candidate_shift_vectors[idx * 3 + 0];
-        double shift_y = candidate_shift_vectors[idx * 3 + 1];
-        double shift_z = candidate_shift_vectors[idx * 3 + 2];
+        double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
+        double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
+        double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
 
         vx = rj[0] - ri[0] + shift_x;
         vy = rj[1] - ri[1] + shift_y;
