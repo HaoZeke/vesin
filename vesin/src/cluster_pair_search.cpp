@@ -383,6 +383,11 @@ void vesin::cpu::filter_cluster_pair_candidates(
 
     auto current_clusters = grid.clusters;
     for (auto& cluster : current_clusters) {
+        for (size_t d = 0; d < 3; d++) {
+            cluster.bb_lower[d] = std::numeric_limits<float>::max();
+            cluster.bb_upper[d] = std::numeric_limits<float>::lowest();
+        }
+
         for (int32_t atom = 0; atom < cluster.n_atoms; atom++) {
             auto atom_index = static_cast<size_t>(cluster.atom_indices[atom]);
             auto wrap_shift = shift_cartesian(grid.atom_wrap_shifts[atom_index], cell);
@@ -390,10 +395,21 @@ void vesin::cpu::filter_cluster_pair_candidates(
             cluster.pos_x[atom] = wrapped[0];
             cluster.pos_y[atom] = wrapped[1];
             cluster.pos_z[atom] = wrapped[2];
+
+            auto x = static_cast<float>(wrapped[0]);
+            auto y = static_cast<float>(wrapped[1]);
+            auto z = static_cast<float>(wrapped[2]);
+            cluster.bb_lower[0] = std::min(cluster.bb_lower[0], x);
+            cluster.bb_lower[1] = std::min(cluster.bb_lower[1], y);
+            cluster.bb_lower[2] = std::min(cluster.bb_lower[2], z);
+            cluster.bb_upper[0] = std::max(cluster.bb_upper[0], x);
+            cluster.bb_upper[1] = std::max(cluster.bb_upper[1], y);
+            cluster.bb_upper[2] = std::max(cluster.bb_upper[2], z);
         }
     }
 
     auto cutoff2 = cutoff * cutoff;
+    auto cutoff2_f = static_cast<float>(cutoff2);
 
     alignas(64) double tmp_dist2[CLUSTER_SIZE_CPU];
     alignas(64) double tmp_dx[CLUSTER_SIZE_CPU];
@@ -404,6 +420,15 @@ void vesin::cpu::filter_cluster_pair_candidates(
     for (const auto& candidate : candidates) {
         const auto& cluster_i = current_clusters[candidate.first_cluster];
         const auto& cluster_j = current_clusters[candidate.second_cluster];
+        float shift_f[3] = {
+            static_cast<float>(candidate.shift_cartesian[0]),
+            static_cast<float>(candidate.shift_cartesian[1]),
+            static_cast<float>(candidate.shift_cartesian[2]),
+        };
+
+        if (bb_distance_sq_shifted(cluster_i, cluster_j, shift_f) > cutoff2_f) {
+            continue;
+        }
 
         for (int32_t ai = 0; ai < cluster_i.n_atoms; ai++) {
             int32_t idx_i = cluster_i.atom_indices[ai];

@@ -123,7 +123,6 @@ void cpu::VerletState::rebuild(
         this->cluster_grid = build_cluster_grid(points, n_points, candidate_box, build_options.cutoff);
         this->cluster_candidates = build_cluster_pair_candidates(this->cluster_grid, candidate_box, build_options.cutoff);
         this->use_cluster_candidates = true;
-        cpu::cluster_pair_neighbors(points, n_points, candidate_box, build_options, this->candidates);
     } else {
         size_t candidate_capacity = 0;
         cpu::stateless_neighbors(points, n_points, std::move(candidate_box), build_options, this->candidates, candidate_capacity);
@@ -161,7 +160,7 @@ void cpu::VerletState::recompute(
 
     auto initial_capacity = std::max(output_capacity, neighbors.length);
 
-    if (this->use_cluster_candidates && this->candidates.length == 0) {
+    if (this->use_cluster_candidates) {
         cpu::filter_cluster_pair_candidates(
             points,
             box,
