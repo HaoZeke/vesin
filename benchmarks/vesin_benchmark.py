@@ -88,7 +88,9 @@ def parse_backends(value: str) -> list[str]:
     return backends
 
 
-def generate_system(n_atoms: int, density: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def generate_system(
+    n_atoms: int, density: float, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
     box_size = (n_atoms / density) ** (1.0 / 3.0)
     rng = np.random.default_rng(seed)
     positions = rng.random((n_atoms, 3), dtype=np.float64) * box_size
@@ -148,13 +150,17 @@ def _to_backend_arrays(
     return positions.copy(), box.copy()
 
 
-def _add_displacement(points: Any, displacement: np.ndarray, backend: str, cp: Any | None) -> Any:
+def _add_displacement(
+    points: Any, displacement: np.ndarray, backend: str, cp: Any | None
+) -> Any:
     if backend == "gpu":
         return points + cp.asarray(displacement)
     return np.ascontiguousarray(points + displacement)
 
 
-def _time_compute(nl: Any, points: Any, box: Any, backend: str, cp: Any | None) -> tuple[float, int]:
+def _time_compute(
+    nl: Any, points: Any, box: Any, backend: str, cp: Any | None
+) -> tuple[float, int]:
     _sync_gpu(cp if backend == "gpu" else None)
     start = time.perf_counter()
     first, _second = nl.compute(points, box, periodic=True, quantities="ij", copy=False)
@@ -314,16 +320,23 @@ def plot_results(rows: list[dict[str, Any]], output: Path) -> None:
     import matplotlib.pyplot as plt
 
     series = group_plot_series(rows)
-    plt.rcParams.update({
-        "font.size": 11,
-        "axes.labelsize": 12,
-        "legend.fontsize": 10,
-        "figure.dpi": 150,
-        "savefig.dpi": 240,
-    })
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.labelsize": 12,
+            "legend.fontsize": 10,
+            "figure.dpi": 150,
+            "savefig.dpi": 240,
+        }
+    )
 
     fig, ax = plt.subplots(figsize=(8.8, 5.4))
-    for key in (("cpu", "stateless"), ("cpu", "verlet"), ("gpu", "stateless"), ("gpu", "verlet")):
+    for key in (
+        ("cpu", "stateless"),
+        ("cpu", "verlet"),
+        ("gpu", "stateless"),
+        ("gpu", "verlet"),
+    ):
         if key not in series:
             continue
         atoms, medians, stdevs = series[key]
@@ -370,8 +383,14 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="measure CPU/GPU pre/post Verlet timings")
     run.add_argument("--output", type=Path, default=Path("vesin_verlet_prepost.csv"))
     run.add_argument("--plot", type=Path, help="also write a plot to this path")
-    run.add_argument("--sizes", type=parse_sizes, default=parse_sizes("1024,2048,4096,8192,16384,32768"))
-    run.add_argument("--backends", type=parse_backends, default=parse_backends("cpu,gpu"))
+    run.add_argument(
+        "--sizes",
+        type=parse_sizes,
+        default=parse_sizes("1024,2048,4096,8192,16384,32768"),
+    )
+    run.add_argument(
+        "--backends", type=parse_backends, default=parse_backends("cpu,gpu")
+    )
     run.add_argument("--density", type=float, default=0.05)
     run.add_argument("--cutoff", type=float, default=5.0)
     run.add_argument("--skin", type=float, default=1.0)
@@ -380,7 +399,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--steps", type=int, default=80)
     run.add_argument("--repeats", type=int, default=3)
     run.add_argument("--seed", type=int, default=20260512)
-    run.add_argument("--algorithm", choices=["auto", "brute_force", "cell_list"], default="cell_list")
+    run.add_argument(
+        "--algorithm", choices=["auto", "brute_force", "cell_list"], default="cell_list"
+    )
     run.set_defaults(func=run_command)
 
     plot = subparsers.add_parser("plot", help="plot one or more benchmark CSV files")
