@@ -86,7 +86,7 @@ extern "C" int vesin_neighbors(
             bounding_box.make_bounding_for(points, n_points);
             auto points_vec = reinterpret_cast<const vesin::Vector*>(points);
 
-            if (options.skin == 0.0 && options.algorithm == VesinAutoAlgorithm && n_points >= CLUSTER_PAIR_THRESHOLD) {
+            if (options.skin == 0.0 && options.algorithm == VesinAutoAlgorithm && n_points >= vesin::CLUSTER_PAIR_THRESHOLD) {
                 vesin::cpu::cluster_pair_neighbors(
                     points_vec,
                     n_points,
