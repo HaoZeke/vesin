@@ -900,7 +900,7 @@ static void recompute_verlet_neighbors(
     kernel->launch(
         dim3(std::max(blocks, static_cast<size_t>(1))),
         dim3(threads),
-        0,
+        sizeof(unsigned int) * threads,
         nullptr,
         args,
         false

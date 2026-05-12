@@ -44,32 +44,66 @@ __global__ void filter_verlet_candidates(
     int* overflow_flag
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= candidate_length) {
-        return;
+    bool valid = idx < candidate_length;
+    double cutoff2 = cutoff * cutoff;
+
+    size_t i = 0;
+    size_t j = 0;
+    int sx = 0;
+    int sy = 0;
+    int sz = 0;
+    double vx = 0.0;
+    double vy = 0.0;
+    double vz = 0.0;
+    double dist_sq = 0.0;
+
+    if (valid) {
+        i = candidate_pairs[idx * 2 + 0];
+        j = candidate_pairs[idx * 2 + 1];
+
+        sx = candidate_shifts[idx * 3 + 0];
+        sy = candidate_shifts[idx * 3 + 1];
+        sz = candidate_shifts[idx * 3 + 2];
+
+        const double* ri = &positions[i * 3];
+        const double* rj = &positions[j * 3];
+
+        double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
+        double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
+        double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
+
+        vx = rj[0] - ri[0] + shift_x;
+        vy = rj[1] - ri[1] + shift_y;
+        vz = rj[2] - ri[2] + shift_z;
+        dist_sq = vx * vx + vy * vy + vz * vz;
     }
 
-    double cutoff2 = cutoff * cutoff;
-    size_t i = candidate_pairs[idx * 2 + 0];
-    size_t j = candidate_pairs[idx * 2 + 1];
+    bool keep = valid && dist_sq < cutoff2;
 
-    int sx = candidate_shifts[idx * 3 + 0];
-    int sy = candidate_shifts[idx * 3 + 1];
-    int sz = candidate_shifts[idx * 3 + 2];
+    extern __shared__ unsigned int shared_counts[];
+    unsigned int local_count = keep ? 1u : 0u;
+    shared_counts[threadIdx.x] = local_count;
+    __syncthreads();
 
-    const double* ri = &positions[i * 3];
-    const double* rj = &positions[j * 3];
+    for (unsigned int offset = 1; offset < blockDim.x; offset <<= 1) {
+        unsigned int value = 0;
+        if (threadIdx.x >= offset) {
+            value = shared_counts[threadIdx.x - offset];
+        }
+        __syncthreads();
+        shared_counts[threadIdx.x] += value;
+        __syncthreads();
+    }
 
-    double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
-    double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
-    double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
+    __shared__ size_t block_base;
+    unsigned int block_count = shared_counts[blockDim.x - 1];
+    if (threadIdx.x == 0) {
+        block_base = block_count == 0 ? 0 : atomicAdd_size_t(length, static_cast<size_t>(block_count));
+    }
+    __syncthreads();
 
-    double vx = rj[0] - ri[0] + shift_x;
-    double vy = rj[1] - ri[1] + shift_y;
-    double vz = rj[2] - ri[2] + shift_z;
-    double dist_sq = vx * vx + vy * vy + vz * vz;
-
-    if (dist_sq < cutoff2) {
-        size_t out = atomicAdd_size_t(length, 1);
+    if (keep) {
+        size_t out = block_base + static_cast<size_t>(shared_counts[threadIdx.x] - 1u);
         if (out >= max_pairs) {
             atomicExch(overflow_flag, 1);
             return;
