@@ -652,6 +652,295 @@ static void sort_pairs_if_needed(
     NVTX_POP();
 }
 
+static bool verlet_options_changed(const CudaNeighborListExtras& extras, VesinOptions options) {
+    return extras.verlet_options.cutoff != options.cutoff ||
+           extras.verlet_options.skin != options.skin ||
+           extras.verlet_options.full != options.full;
+}
+
+static bool verlet_box_changed(
+    const CudaNeighborListExtras& extras,
+    const double h_box[9],
+    const bool h_periodic[3]
+) {
+    for (size_t i = 0; i < 9; i++) {
+        if (std::abs(extras.verlet_ref_box[i] - h_box[i]) > 1e-12) {
+            return true;
+        }
+    }
+
+    for (size_t i = 0; i < 3; i++) {
+        if (extras.verlet_ref_periodic[i] != h_periodic[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void ensure_verlet_ref_buffers(CudaNeighborListExtras& extras, size_t n_points) {
+    if (extras.verlet_ref_capacity < n_points) {
+        GPULITE_CUDART_CALL(cudaFree(extras.verlet_ref_positions));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_ref_positions, sizeof(double) * n_points * 3));
+        extras.verlet_ref_capacity = n_points;
+    }
+
+    if (extras.verlet_rebuild_flag == nullptr) {
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_rebuild_flag, sizeof(int32_t)));
+    }
+}
+
+static bool verlet_needs_rebuild(
+    CudaNeighborListExtras& extras,
+    gpulite::KernelFactory& factory,
+    const std::string& cuda_verlet_code,
+    const double* d_positions,
+    size_t n_points,
+    const double h_box[9],
+    const bool h_periodic[3]
+) {
+    if (!extras.verlet_has_cache) {
+        return true;
+    }
+
+    if (extras.verlet_n_points != n_points) {
+        return true;
+    }
+
+    if (verlet_box_changed(extras, h_box, h_periodic)) {
+        return true;
+    }
+
+    GPULITE_CUDART_CALL(cudaMemset(extras.verlet_rebuild_flag, 0, sizeof(int32_t)));
+
+    auto* kernel = factory.create(
+        "check_verlet_displacements",
+        cuda_verlet_code,
+        "cuda_verlet.cu",
+        {"-std=c++17", "-default-device"}
+    );
+
+    size_t threads = 256;
+    size_t blocks = (n_points + threads - 1) / threads;
+    auto* d_ref_positions = extras.verlet_ref_positions;
+    auto* d_rebuild_flag = extras.verlet_rebuild_flag;
+    std::vector<void*> args = {
+        static_cast<void*>(&d_positions),
+        static_cast<void*>(&d_ref_positions),
+        static_cast<void*>(&n_points),
+        static_cast<void*>(&extras.verlet_half_skin_sq),
+        static_cast<void*>(&d_rebuild_flag),
+    };
+    kernel->launch(
+        dim3(std::max(blocks, static_cast<size_t>(1))),
+        dim3(threads),
+        0,
+        nullptr,
+        args,
+        false
+    );
+
+    int32_t h_rebuild = 0;
+    GPULITE_CUDART_CALL(cudaMemcpy(&h_rebuild, d_rebuild_flag, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    return h_rebuild != 0;
+}
+
+static void rebuild_verlet_cache(
+    CudaNeighborListExtras& extras,
+    const double (*points)[3],
+    size_t n_points,
+    const double box[3][3],
+    const bool periodic[3],
+    int32_t device_id,
+    VesinOptions options,
+    const double h_box[9],
+    const bool h_periodic[3]
+) {
+    if (extras.verlet_candidates.device.type == VesinCUDA) {
+        free_neighbors(extras.verlet_candidates);
+    }
+
+    extras.verlet_candidates = VesinNeighborList();
+    extras.verlet_candidates.device = {VesinCUDA, device_id};
+
+    auto build_options = VesinOptions();
+    build_options.cutoff = options.cutoff + options.skin;
+    build_options.full = options.full;
+    build_options.sorted = false;
+    build_options.algorithm = VesinCellList;
+    build_options.return_shifts = true;
+    build_options.return_distances = false;
+    build_options.return_vectors = false;
+    build_options.skin = 0.0;
+
+    vesin::cuda::neighbors(
+        points,
+        n_points,
+        box,
+        periodic,
+        build_options,
+        extras.verlet_candidates
+    );
+
+    ensure_verlet_ref_buffers(extras, n_points);
+    GPULITE_CUDART_CALL(cudaMemcpy(
+        extras.verlet_ref_positions,
+        points,
+        sizeof(double) * n_points * 3,
+        cudaMemcpyDeviceToDevice
+    ));
+
+    std::memcpy(extras.verlet_ref_box, h_box, sizeof(double) * 9);
+    std::memcpy(extras.verlet_ref_periodic, h_periodic, sizeof(bool) * 3);
+    extras.verlet_n_points = n_points;
+    extras.verlet_options = options;
+    extras.verlet_half_skin_sq = (options.skin / 2.0) * (options.skin / 2.0);
+    extras.verlet_has_cache = true;
+}
+
+static void ensure_verlet_output_buffers(
+    VesinNeighborList& neighbors,
+    CudaNeighborListExtras& extras,
+    size_t n_points,
+    size_t max_pairs,
+    VesinOptions options
+) {
+    bool missing_requested_output =
+        (options.return_shifts && neighbors.shifts == nullptr) ||
+        (options.return_distances && neighbors.distances == nullptr) ||
+        (options.return_vectors && neighbors.vectors == nullptr);
+
+    if (extras.max_pairs < max_pairs || extras.length_ptr == nullptr || extras.overflow_flag == nullptr ||
+        extras.pinned_length_ptr == nullptr || extras.cell_check_ptr == nullptr || missing_requested_output) {
+        free_output_buffers(neighbors, extras);
+
+        extras.max_pairs = std::max(max_pairs, static_cast<size_t>(1));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&neighbors.pairs, sizeof(size_t) * extras.max_pairs * 2));
+
+        if (options.return_shifts) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&neighbors.shifts, sizeof(int32_t) * extras.max_pairs * 3));
+        }
+
+        if (options.return_distances) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&neighbors.distances, sizeof(double) * extras.max_pairs));
+        }
+
+        if (options.return_vectors) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&neighbors.vectors, sizeof(double) * extras.max_pairs * 3));
+        }
+
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.length_ptr, sizeof(size_t)));
+        GPULITE_CUDART_CALL(cudaHostAlloc(
+            (void**)&extras.pinned_length_ptr,
+            sizeof(size_t),
+            cudaHostAllocDefault
+        ));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.cell_check_ptr, sizeof(int32_t)));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.overflow_flag, sizeof(int32_t)));
+        extras.capacity = n_points;
+    }
+
+    GPULITE_CUDART_CALL(cudaMemset(extras.length_ptr, 0, sizeof(size_t)));
+    GPULITE_CUDART_CALL(cudaMemset(extras.cell_check_ptr, 0, sizeof(int32_t)));
+    GPULITE_CUDART_CALL(cudaMemset(extras.overflow_flag, 0, sizeof(int32_t)));
+}
+
+static void recompute_verlet_neighbors(
+    CudaNeighborListExtras& extras,
+    gpulite::KernelFactory& factory,
+    const std::string& cuda_verlet_code,
+    const std::string& cuda_sort_pairs_code,
+    const double* d_positions,
+    const double* d_box,
+    VesinOptions options,
+    VesinNeighborList& neighbors
+) {
+    size_t candidate_length = extras.verlet_candidates.length;
+    ensure_verlet_output_buffers(neighbors, extras, extras.verlet_n_points, candidate_length, options);
+
+    auto* d_pair_indices = reinterpret_cast<size_t*>(neighbors.pairs);
+    auto* d_shifts = reinterpret_cast<int32_t*>(neighbors.shifts);
+    auto* d_distances = neighbors.distances;
+    auto* d_vectors = reinterpret_cast<double*>(neighbors.vectors);
+    auto* d_pair_counter = extras.length_ptr;
+    auto* d_overflow_flag = extras.overflow_flag;
+    size_t max_pairs = extras.max_pairs;
+
+    auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
+    auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
+
+    auto* kernel = factory.create(
+        "filter_verlet_candidates",
+        cuda_verlet_code,
+        "cuda_verlet.cu",
+        {"-std=c++17", "-default-device"}
+    );
+
+    size_t threads = 256;
+    size_t blocks = (candidate_length + threads - 1) / threads;
+    std::vector<void*> args = {
+        static_cast<void*>(&d_positions),
+        static_cast<void*>(&d_box),
+        static_cast<void*>(&d_candidate_pairs),
+        static_cast<void*>(&d_candidate_shifts),
+        static_cast<void*>(&candidate_length),
+        static_cast<void*>(&options.cutoff),
+        static_cast<void*>(&d_pair_counter),
+        static_cast<void*>(&d_pair_indices),
+        static_cast<void*>(&d_shifts),
+        static_cast<void*>(&d_distances),
+        static_cast<void*>(&d_vectors),
+        static_cast<void*>(&options.return_shifts),
+        static_cast<void*>(&options.return_distances),
+        static_cast<void*>(&options.return_vectors),
+        static_cast<void*>(&max_pairs),
+        static_cast<void*>(&d_overflow_flag),
+    };
+
+    kernel->launch(
+        dim3(std::max(blocks, static_cast<size_t>(1))),
+        dim3(threads),
+        0,
+        nullptr,
+        args,
+        false
+    );
+
+    GPULITE_CUDART_CALL(cudaMemcpyAsync(
+        extras.pinned_length_ptr,
+        d_pair_counter,
+        sizeof(size_t),
+        cudaMemcpyDeviceToHost,
+        nullptr
+    ));
+    GPULITE_CUDART_CALL(cudaDeviceSynchronize());
+
+    int h_overflow_flag = 0;
+    GPULITE_CUDART_CALL(cudaMemcpy(
+        &h_overflow_flag,
+        d_overflow_flag,
+        sizeof(int),
+        cudaMemcpyDeviceToHost
+    ));
+
+    if (h_overflow_flag != 0) {
+        throw std::runtime_error("The CUDA Verlet output exceeds the cached candidate capacity");
+    }
+
+    neighbors.length = *extras.pinned_length_ptr;
+    sort_pairs_if_needed(
+        extras,
+        factory,
+        cuda_sort_pairs_code,
+        options,
+        neighbors,
+        d_pair_indices,
+        d_shifts,
+        d_distances,
+        d_vectors
+    );
+}
+
 void vesin::cuda::neighbors(
     const double (*points)[3],
     size_t n_points,
@@ -664,10 +953,6 @@ void vesin::cuda::neighbors(
 
     // Check if CUDA is available
     checkCuda();
-
-    if (options.skin > 0.0) {
-        throw std::runtime_error("Verlet caching with skin > 0 is not supported with CUDA");
-    }
 
     // check that all pointers are are device pointers
     if (!is_device_ptr(getPtrAttributes(points), "points")) {
@@ -701,6 +986,11 @@ void vesin::cuda::neighbors(
         static_cast<size_t>(std::ceil(std::pow(options.cutoff, 3)))
     );
 
+    double h_box[9];
+    bool h_periodic[3];
+    GPULITE_CUDART_CALL(cudaMemcpy(h_box, box, sizeof(double) * 9, cudaMemcpyDeviceToHost));
+    GPULITE_CUDART_CALL(cudaMemcpy(h_periodic, periodic, sizeof(bool) * 3, cudaMemcpyDeviceToHost));
+
     if (extras->allocated_device_id != device_id) {
         // first switch to previous device
         if (extras->allocated_device_id >= 0) {
@@ -713,7 +1003,62 @@ void vesin::cuda::neighbors(
         extras->allocated_device_id = device_id;
     }
 
-    if (extras->capacity >= n_points && (extras->length_ptr != nullptr)) {
+    auto& factory = gpulite::KernelFactory::instance(device_id);
+
+    auto cuda_bruteforce_code = std::string(reinterpret_cast<const char*>(CUDA_BRUTEFORCE_CODE), sizeof(CUDA_BRUTEFORCE_CODE));
+    auto cuda_cell_list_code = std::string(reinterpret_cast<const char*>(CUDA_CELL_LIST_CODE), sizeof(CUDA_CELL_LIST_CODE));
+    auto cuda_sort_pairs_code = std::string(reinterpret_cast<const char*>(CUDA_SORT_PAIRS_CODE), sizeof(CUDA_SORT_PAIRS_CODE));
+    auto cuda_verlet_code = std::string(reinterpret_cast<const char*>(CUDA_VERLET_CODE), sizeof(CUDA_VERLET_CODE));
+
+    if (options.skin > 0.0) {
+        if (verlet_options_changed(*extras, options)) {
+            free_verlet_buffers(*extras);
+        }
+
+        if (verlet_needs_rebuild(
+                *extras,
+                factory,
+                cuda_verlet_code,
+                reinterpret_cast<const double*>(points),
+                n_points,
+                h_box,
+                h_periodic
+            )) {
+            rebuild_verlet_cache(
+                *extras,
+                points,
+                n_points,
+                box,
+                periodic,
+                device_id,
+                options,
+                h_box,
+                h_periodic
+            );
+        }
+
+        recompute_verlet_neighbors(
+            *extras,
+            factory,
+            cuda_verlet_code,
+            cuda_sort_pairs_code,
+            reinterpret_cast<const double*>(points),
+            reinterpret_cast<const double*>(box),
+            options,
+            neighbors
+        );
+        return;
+    }
+
+    free_verlet_buffers(*extras);
+
+    bool missing_requested_output =
+        (options.return_shifts && neighbors.shifts == nullptr) ||
+        (options.return_distances && neighbors.distances == nullptr) ||
+        (options.return_vectors && neighbors.vectors == nullptr);
+
+    if (extras->capacity >= n_points && (extras->length_ptr != nullptr) && (extras->cell_check_ptr != nullptr) &&
+        (extras->overflow_flag != nullptr) && !missing_requested_output) {
         GPULITE_CUDART_CALL(cudaMemset(extras->length_ptr, 0, sizeof(size_t)));
         GPULITE_CUDART_CALL(cudaMemset(extras->cell_check_ptr, 0, sizeof(int32_t)));
         GPULITE_CUDART_CALL(cudaMemset(extras->overflow_flag, 0, sizeof(int32_t)));
@@ -784,12 +1129,6 @@ void vesin::cuda::neighbors(
     auto* d_cell_check = extras->cell_check_ptr;
     auto* d_overflow_flag = extras->overflow_flag;
     size_t max_pairs = extras->max_pairs;
-
-    auto& factory = gpulite::KernelFactory::instance(device_id);
-
-    auto cuda_bruteforce_code = std::string(reinterpret_cast<const char*>(CUDA_BRUTEFORCE_CODE), sizeof(CUDA_BRUTEFORCE_CODE));
-    auto cuda_cell_list_code = std::string(reinterpret_cast<const char*>(CUDA_CELL_LIST_CODE), sizeof(CUDA_CELL_LIST_CODE));
-    auto cuda_sort_pairs_code = std::string(reinterpret_cast<const char*>(CUDA_SORT_PAIRS_CODE), sizeof(CUDA_SORT_PAIRS_CODE));
 
     if (extras->box_diag == nullptr) {
         GPULITE_CUDART_CALL(cudaMalloc((void**)&extras->box_diag, sizeof(double) * 3));
