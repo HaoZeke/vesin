@@ -977,11 +977,12 @@ static void recompute_verlet_neighbors(
         auto* d_candidate_shifts = extras.verlet_compact_candidate_shifts;
 
         auto* kernel = factory.create(
-            "filter_verlet_compact_candidates",
+            "filter_verlet_compact_candidates_block",
             cuda_verlet_code,
             "cuda_verlet.cu",
             {"-std=c++17", "-default-device"}
         );
+        size_t shared_mem = sizeof(uint32_t) * ((threads + 31) / 32 + 1);
 
         std::vector<void*> args = {
             static_cast<void*>(&d_positions),
@@ -1005,7 +1006,7 @@ static void recompute_verlet_neighbors(
         kernel->launch(
             dim3(std::max(blocks, static_cast<size_t>(1))),
             dim3(threads),
-            0,
+            shared_mem,
             nullptr,
             args,
             false
