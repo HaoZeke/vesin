@@ -151,44 +151,34 @@ __global__ void filter_verlet_compact_candidates_block(
     size_t max_pairs,
     int* overflow_flag
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    bool valid = idx < candidate_length;
-    double cutoff2 = cutoff * cutoff;
+    const double cutoff2 = cutoff * cutoff;
 
-    size_t i = 0;
-    size_t j = 0;
-    int sx = 0;
-    int sy = 0;
-    int sz = 0;
-    double vx = 0.0;
-    double vy = 0.0;
-    double vz = 0.0;
-    double dist_sq = 0.0;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < candidate_length;
+         idx += blockDim.x * gridDim.x) {
 
-    if (valid) {
-        i = static_cast<size_t>(candidate_pairs[idx * 2 + 0]);
-        j = static_cast<size_t>(candidate_pairs[idx * 2 + 1]);
+        size_t i = static_cast<size_t>(candidate_pairs[idx * 2 + 0]);
+        size_t j = static_cast<size_t>(candidate_pairs[idx * 2 + 1]);
 
         int packed_shift = candidate_shifts[idx];
-        sx = unpack_verlet_shift(packed_shift, 0);
-        sy = unpack_verlet_shift(packed_shift, 10);
-        sz = unpack_verlet_shift(packed_shift, 20);
+        int sx = unpack_verlet_shift(packed_shift, 0);
+        int sy = unpack_verlet_shift(packed_shift, 10);
+        int sz = unpack_verlet_shift(packed_shift, 20);
 
         const double* ri = &positions[i * 3];
         const double* rj = &positions[j * 3];
 
-        vx = rj[0] - ri[0];
-        vy = rj[1] - ri[1];
-        vz = rj[2] - ri[2];
+        double vx = rj[0] - ri[0];
+        double vy = rj[1] - ri[1];
+        double vz = rj[2] - ri[2];
         if (sx != 0 || sy != 0 || sz != 0) {
             vx += sx * box[0] + sy * box[3] + sz * box[6];
             vy += sx * box[1] + sy * box[4] + sz * box[7];
             vz += sx * box[2] + sy * box[5] + sz * box[8];
         }
-        dist_sq = vx * vx + vy * vy + vz * vz;
-    }
+        double dist_sq = vx * vx + vy * vy + vz * vz;
 
-    bool keep = valid && dist_sq < cutoff2;
+        bool keep = dist_sq < cutoff2;
     unsigned active_mask = __activemask();
     unsigned passing_mask = __ballot_sync(active_mask, keep);
     int lane = threadIdx.x & 31;
@@ -248,7 +238,7 @@ __global__ void filter_verlet_compact_candidates_block(
     }
 }
 
-__global__ __launch_bounds__(256) void filter_verlet_candidates(
+__global__ void filter_verlet_candidates(
     const double* __restrict__ positions,
     const double* __restrict__ box,
     const size_t* __restrict__ candidate_pairs,
@@ -266,55 +256,56 @@ __global__ __launch_bounds__(256) void filter_verlet_candidates(
     size_t max_pairs,
     int* overflow_flag
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= candidate_length) {
-        return;
-    }
+    const double cutoff2 = cutoff * cutoff;
 
-    double cutoff2 = cutoff * cutoff;
-    size_t i = candidate_pairs[idx * 2 + 0];
-    size_t j = candidate_pairs[idx * 2 + 1];
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < candidate_length;
+         idx += blockDim.x * gridDim.x) {
 
-    int sx = candidate_shifts[idx * 3 + 0];
-    int sy = candidate_shifts[idx * 3 + 1];
-    int sz = candidate_shifts[idx * 3 + 2];
+        size_t i = candidate_pairs[idx * 2 + 0];
+        size_t j = candidate_pairs[idx * 2 + 1];
 
-    const double* ri = &positions[i * 3];
-    const double* rj = &positions[j * 3];
+        int sx = candidate_shifts[idx * 3 + 0];
+        int sy = candidate_shifts[idx * 3 + 1];
+        int sz = candidate_shifts[idx * 3 + 2];
 
-    double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
-    double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
-    double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
+        const double* ri = &positions[i * 3];
+        const double* rj = &positions[j * 3];
 
-    double vx = rj[0] - ri[0] + shift_x;
-    double vy = rj[1] - ri[1] + shift_y;
-    double vz = rj[2] - ri[2] + shift_z;
-    double dist_sq = vx * vx + vy * vy + vz * vz;
+        double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
+        double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
+        double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
 
-    if (dist_sq < cutoff2) {
-        size_t out = atomicAdd_size_t(length, 1);
-        if (out >= max_pairs) {
-            atomicExch(overflow_flag, 1);
-            return;
-        }
+        double vx = rj[0] - ri[0] + shift_x;
+        double vy = rj[1] - ri[1] + shift_y;
+        double vz = rj[2] - ri[2] + shift_z;
+        double dist_sq = vx * vx + vy * vy + vz * vz;
 
-        pair_indices[out * 2 + 0] = i;
-        pair_indices[out * 2 + 1] = j;
+        if (dist_sq < cutoff2) {
+            size_t out = atomicAdd_size_t(length, 1);
+            if (out >= max_pairs) {
+                atomicExch(overflow_flag, 1);
+                continue;
+            }
 
-        if (return_shifts) {
-            shifts_out[out * 3 + 0] = sx;
-            shifts_out[out * 3 + 1] = sy;
-            shifts_out[out * 3 + 2] = sz;
-        }
+            pair_indices[out * 2 + 0] = i;
+            pair_indices[out * 2 + 1] = j;
 
-        if (return_distances) {
-            distances[out] = sqrt(dist_sq);
-        }
+            if (return_shifts) {
+                shifts_out[out * 3 + 0] = sx;
+                shifts_out[out * 3 + 1] = sy;
+                shifts_out[out * 3 + 2] = sz;
+            }
 
-        if (return_vectors) {
-            vectors[out * 3 + 0] = vx;
-            vectors[out * 3 + 1] = vy;
-            vectors[out * 3 + 2] = vz;
+            if (return_distances) {
+                distances[out] = sqrt(dist_sq);
+            }
+
+            if (return_vectors) {
+                vectors[out * 3 + 0] = vx;
+                vectors[out * 3 + 1] = vy;
+                vectors[out * 3 + 2] = vz;
+            }
         }
     }
 }
