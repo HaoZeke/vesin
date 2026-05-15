@@ -225,7 +225,7 @@ def test_non_periodic():
     assert verlet == ref
 
 
-def test_auto_verlet_many_candidate_recompute_runs_in_subprocess():
+def test_auto_verlet_many_candidate_recompute_runs_in_subprocess(tmp_path):
     script = textwrap.dedent(
         """
         import numpy as np
@@ -263,6 +263,7 @@ def test_auto_verlet_many_candidate_recompute_runs_in_subprocess():
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
+        cwd=tmp_path,
         text=True,
     )
 
