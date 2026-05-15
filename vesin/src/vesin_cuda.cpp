@@ -53,7 +53,7 @@ static constexpr size_t DEFAULT_MAX_CELLS = 8192;
 // Lower values create more cells and reduce per-cell neighbor work, which is
 // beneficial on larger systems where more coarse grids become too dense.
 static constexpr size_t MIN_PARTICLES_PER_CELL = 8;
-static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 16384;
+static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 1024;  // lowered so the efficient block-compact + sorted path is used even in medium-size profiling runs (real hotspot data)
 
 // Helper functions for CPU-side vector math
 static inline double cpu_dot3(const double* a, const double* b) {
