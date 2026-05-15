@@ -262,12 +262,22 @@ __global__ void filter_verlet_candidates(
     }
 
     double cutoff2 = cutoff * cutoff;
-    size_t i = candidate_pairs[idx * 2 + 0];
-    size_t j = candidate_pairs[idx * 2 + 1];
+    size_t i = 0;
+    size_t j = 0;
+    int sx = 0;
+    int sy = 0;
+    int sz = 0;
+    double vx = 0.0;
+    double vy = 0.0;
+    double vz = 0.0;
+    double dist_sq = 0.0;
 
-    int sx = candidate_shifts[idx * 3 + 0];
-    int sy = candidate_shifts[idx * 3 + 1];
-    int sz = candidate_shifts[idx * 3 + 2];
+    i = candidate_pairs[idx * 2 + 0];
+    j = candidate_pairs[idx * 2 + 1];
+
+    sx = candidate_shifts[idx * 3 + 0];
+    sy = candidate_shifts[idx * 3 + 1];
+    sz = candidate_shifts[idx * 3 + 2];
 
     const double* ri = &positions[i * 3];
     const double* rj = &positions[j * 3];
@@ -276,10 +286,10 @@ __global__ void filter_verlet_candidates(
     double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
     double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
 
-    double vx = rj[0] - ri[0] + shift_x;
-    double vy = rj[1] - ri[1] + shift_y;
-    double vz = rj[2] - ri[2] + shift_z;
-    double dist_sq = vx * vx + vy * vy + vz * vz;
+    vx = rj[0] - ri[0] + shift_x;
+    vy = rj[1] - ri[1] + shift_y;
+    vz = rj[2] - ri[2] + shift_z;
+    dist_sq = vx * vx + vy * vy + vz * vz;
 
     if (dist_sq < cutoff2) {
         size_t out = atomicAdd_size_t(length, 1);
