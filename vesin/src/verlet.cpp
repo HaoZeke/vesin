@@ -100,6 +100,90 @@ static void simd_filter_deltas(
     }
 }
 
+// Vectorized gather of pair deltas using Highway for the Verlet recompute hot path.
+// Gathers x/y/z for atom i and j using byte-offset gathers, computes (j - i) + shift
+// in SIMD registers, and stores to the dx/dy/dz temporaries for the subsequent filter.
+HWY_ATTR
+static void gather_pair_deltas(
+    const Vector* HWY_RESTRICT points,
+    const size_t* HWY_RESTRICT first,
+    const size_t* HWY_RESTRICT second,
+    const double* HWY_RESTRICT shift_x,
+    const double* HWY_RESTRICT shift_y,
+    const double* HWY_RESTRICT shift_z,
+    size_t count,
+    double* HWY_RESTRICT dx,
+    double* HWY_RESTRICT dy,
+    double* HWY_RESTRICT dz
+) {
+    const hn::ScalableTag<double> d;
+    const hn::ScalableTag<int64_t> di64;
+    const size_t N = hn::Lanes(d);
+    const double* base = reinterpret_cast<const double*>(points);
+    const auto k_three = hn::Set(di64, int64_t{3});
+    const auto k_one = hn::Set(di64, int64_t{1});
+
+    size_t lane = 0;
+    for (; lane + N <= count; lane += N) {
+        // Load atom indices as signed (safe for practical atom counts < 2^63)
+        // Note: first/second are size_t but values are non-negative.
+        alignas(64) int64_t i_idx[8] = {};
+        alignas(64) int64_t j_idx[8] = {};
+        for (size_t k = 0; k < N; k++) {
+            i_idx[k] = static_cast<int64_t>(first[lane + k]);
+            j_idx[k] = static_cast<int64_t>(second[lane + k]);
+        }
+        auto v_i = hn::Load(di64, i_idx);
+        auto v_j = hn::Load(di64, j_idx);
+
+        // Element indices for x: atom * 3
+        auto idx_i_x = hn::Mul(v_i, k_three);
+        auto idx_j_x = hn::Mul(v_j, k_three);
+
+        auto vxi = hn::GatherIndex(d, base, idx_i_x);
+        auto vxj = hn::GatherIndex(d, base, idx_j_x);
+
+        // y: +1
+        auto idx_i_y = hn::Add(idx_i_x, k_one);
+        auto idx_j_y = hn::Add(idx_j_x, k_one);
+        auto vyi = hn::GatherIndex(d, base, idx_i_y);
+        auto vyj = hn::GatherIndex(d, base, idx_j_y);
+
+        // z: +2
+        auto idx_i_z = hn::Add(idx_i_y, k_one);
+        auto idx_j_z = hn::Add(idx_j_y, k_one);
+        auto vzi = hn::GatherIndex(d, base, idx_i_z);
+        auto vzj = hn::GatherIndex(d, base, idx_j_z);
+
+        // deltas j - i
+        auto vdx = hn::Sub(vxj, vxi);
+        auto vdy = hn::Sub(vyj, vyi);
+        auto vdz = hn::Sub(vzj, vzi);
+
+        // load and add precomputed Cartesian shifts
+        auto vsx = hn::Load(d, shift_x + lane);
+        auto vsy = hn::Load(d, shift_y + lane);
+        auto vsz = hn::Load(d, shift_z + lane);
+
+        vdx = hn::Add(vdx, vsx);
+        vdy = hn::Add(vdy, vsy);
+        vdz = hn::Add(vdz, vsz);
+
+        hn::Store(vdx, d, dx + lane);
+        hn::Store(vdy, d, dy + lane);
+        hn::Store(vdz, d, dz + lane);
+    }
+
+    // Scalar tail for remainder (when count % N != 0)
+    for (; lane < count; lane++) {
+        auto i = first[lane];
+        auto j = second[lane];
+        dx[lane] = points[j][0] - points[i][0] + shift_x[lane];
+        dy[lane] = points[j][1] - points[i][1] + shift_y[lane];
+        dz[lane] = points[j][2] - points[i][2] + shift_z[lane];
+    }
+}
+
 static void filter_simd_candidate_blocks(
     const Vector* points,
     const std::vector<cpu::VerletCandidateBlock>& blocks,
@@ -119,12 +203,21 @@ static void filter_simd_candidate_blocks(
     uint8_t mask[CLUSTER_SIZE_CPU];
 
     for (const auto& block : blocks) {
-        for (size_t lane = 0; lane < block.count; lane++) {
-            auto i = block.first[lane];
-            auto j = block.second[lane];
-            dx[lane] = points[j][0] - points[i][0] + block.shift_x[lane];
-            dy[lane] = points[j][1] - points[i][1] + block.shift_y[lane];
-            dz[lane] = points[j][2] - points[i][2] + block.shift_z[lane];
+        // Vectorized gather + arithmetic for the valid lanes (uses Highway Gather
+        // for random-access position loads, enabling better load parallelism on AVX2/AVX-512).
+        if (block.count > 0) {
+            gather_pair_deltas(
+                points,
+                block.first,
+                block.second,
+                block.shift_x,
+                block.shift_y,
+                block.shift_z,
+                block.count,
+                dx,
+                dy,
+                dz
+            );
         }
         for (size_t lane = block.count; lane < CLUSTER_SIZE_CPU; lane++) {
             dx[lane] = std::numeric_limits<double>::infinity();
