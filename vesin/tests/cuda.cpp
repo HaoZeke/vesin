@@ -156,8 +156,8 @@ TEST_CASE("Test CUDA") {
     }
 }
 
-// Additional test for CUDA Verlet skin cache path (for profiling with ncu)
-// Uses larger system so the filter kernel launches many blocks and occupancy metrics are meaningful
+// Additional test for CUDA Verlet skin cache path (for ncu profiling of filter_verlet_candidates / check_verlet_displacements).
+// Small system that reliably triggers the cache path (as verified by ncu capturing the kernels). For full occupancy on large grids, use the Python benchmark under ncu.
 TEST_CASE("Test CUDA Verlet skin cache") {
     int n_devices = 0;
     check_cuda(cudaGetDeviceCount(&n_devices));
@@ -165,15 +165,19 @@ TEST_CASE("Test CUDA Verlet skin cache") {
     int device_id = 0;
     check_cuda(cudaSetDevice(device_id));
 
-    // larger system for meaningful occupancy in filter kernels (N=2048)
-    const size_t n_points = 2048;
-    std::vector<double> h_points(n_points * 3);
-    for (size_t i = 0; i < h_points.size(); ++i) h_points[i] = (i % 100) * 0.1;  // simple pattern
+    // small but sufficient system to exercise the Verlet cache kernels
+    double points[][3] = {
+        {0.0, 0.0, 0.0},
+        {1.0, 1.0, 1.0},
+        {2.0, 2.0, 2.0},
+        {4.0, 1.0, 0.0},
+    };
+    size_t n_points = 4;
     double (*d_points)[3] = nullptr;
     check_cuda(cudaMalloc(&d_points, sizeof(double) * n_points * 3));
-    check_cuda(cudaMemcpy(d_points, h_points.data(), sizeof(double) * n_points * 3, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_points, points, sizeof(double) * n_points * 3, cudaMemcpyHostToDevice));
 
-    double box[3][3] = {{20.0, 0.0, 0.0}, {0.0, 20.0, 0.0}, {0.0, 0.0, 20.0}};
+    double box[3][3] = {{10.0, 0.0, 0.0}, {0.0, 10.0, 0.0}, {0.0, 0.0, 10.0}};
     double (*d_box)[3] = nullptr;
     check_cuda(cudaMalloc(&d_box, sizeof(double) * 9));
     check_cuda(cudaMemcpy(d_box, box, sizeof(double) * 9, cudaMemcpyHostToDevice));
@@ -186,8 +190,8 @@ TEST_CASE("Test CUDA Verlet skin cache") {
     VesinNeighborList neighbors = {};
 
     auto options = VesinOptions();
-    options.cutoff = 3.0;
-    options.skin = 1.0;  // enable Verlet cache (cutoff + skin)
+    options.cutoff = 2.5;
+    options.skin = 0.8;  // enable Verlet cache path
     options.full = true;
     options.sorted = false;
     options.algorithm = VesinAutoAlgorithm;
@@ -203,9 +207,14 @@ TEST_CASE("Test CUDA Verlet skin cache") {
     REQUIRE(error_message == nullptr);
     REQUIRE(status == EXIT_SUCCESS);
 
-    // second call with small displacement (< skin/2) -> hits cache check + filter kernels with large candidate list
-    for (size_t i = 0; i < h_points.size(); ++i) h_points[i] += 0.05;
-    check_cuda(cudaMemcpy(d_points, h_points.data(), sizeof(double) * n_points * 3, cudaMemcpyHostToDevice));
+    // second call with small displacement to hit the cache filter kernels
+    double moved_points[][3] = {
+        {0.01, 0.01, 0.01},
+        {1.02, 1.01, 0.99},
+        {2.00, 2.03, 1.98},
+        {4.01, 1.02, 0.01},
+    };
+    check_cuda(cudaMemcpy(d_points, moved_points, sizeof(double) * n_points * 3, cudaMemcpyHostToDevice));
 
     status = vesin_neighbors(
         d_points, n_points, d_box, d_periodic,
