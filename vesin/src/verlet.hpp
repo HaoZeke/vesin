@@ -13,15 +13,23 @@ namespace vesin {
 namespace cpu {
 
 /// Fixed-width candidate block for SIMD filtering of cached Verlet pairs.
-struct VerletCandidateBlock {
+struct alignas(64) VerletCandidateBlock {
     size_t count = 0;
-    size_t first[CLUSTER_SIZE_CPU] = {};
-    size_t second[CLUSTER_SIZE_CPU] = {};
-    CellShift shifts[CLUSTER_SIZE_CPU] = {};
-    double shift_x[CLUSTER_SIZE_CPU] = {};
-    double shift_y[CLUSTER_SIZE_CPU] = {};
-    double shift_z[CLUSTER_SIZE_CPU] = {};
+    alignas(64) size_t first[CLUSTER_SIZE_CPU] = {};
+    alignas(64) size_t second[CLUSTER_SIZE_CPU] = {};
+    alignas(64) CellShift shifts[CLUSTER_SIZE_CPU] = {};
+    alignas(64) double shift_x[CLUSTER_SIZE_CPU] = {};
+    alignas(64) double shift_y[CLUSTER_SIZE_CPU] = {};
+    alignas(64) double shift_z[CLUSTER_SIZE_CPU] = {};
 };
+
+static_assert(alignof(VerletCandidateBlock) >= 64);
+static_assert(offsetof(VerletCandidateBlock, first) % 64 == 0);
+static_assert(offsetof(VerletCandidateBlock, second) % 64 == 0);
+static_assert(offsetof(VerletCandidateBlock, shifts) % 64 == 0);
+static_assert(offsetof(VerletCandidateBlock, shift_x) % 64 == 0);
+static_assert(offsetof(VerletCandidateBlock, shift_y) % 64 == 0);
+static_assert(offsetof(VerletCandidateBlock, shift_z) % 64 == 0);
 
 /// State for a cached, on-CPU Verlet neighbor list.
 ///
