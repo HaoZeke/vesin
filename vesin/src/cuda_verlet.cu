@@ -256,56 +256,55 @@ __global__ void filter_verlet_candidates(
     size_t max_pairs,
     int* overflow_flag
 ) {
-    const double cutoff2 = cutoff * cutoff;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= candidate_length) {
+        return;
+    }
 
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < candidate_length;
-         idx += blockDim.x * gridDim.x) {
+    double cutoff2 = cutoff * cutoff;
+    size_t i = candidate_pairs[idx * 2 + 0];
+    size_t j = candidate_pairs[idx * 2 + 1];
 
-        size_t i = candidate_pairs[idx * 2 + 0];
-        size_t j = candidate_pairs[idx * 2 + 1];
+    int sx = candidate_shifts[idx * 3 + 0];
+    int sy = candidate_shifts[idx * 3 + 1];
+    int sz = candidate_shifts[idx * 3 + 2];
 
-        int sx = candidate_shifts[idx * 3 + 0];
-        int sy = candidate_shifts[idx * 3 + 1];
-        int sz = candidate_shifts[idx * 3 + 2];
+    const double* ri = &positions[i * 3];
+    const double* rj = &positions[j * 3];
 
-        const double* ri = &positions[i * 3];
-        const double* rj = &positions[j * 3];
+    double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
+    double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
+    double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
 
-        double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
-        double shift_y = sx * box[1] + sy * box[4] + sz * box[7];
-        double shift_z = sx * box[2] + sy * box[5] + sz * box[8];
+    double vx = rj[0] - ri[0] + shift_x;
+    double vy = rj[1] - ri[1] + shift_y;
+    double vz = rj[2] - ri[2] + shift_z;
+    double dist_sq = vx * vx + vy * vy + vz * vz;
 
-        double vx = rj[0] - ri[0] + shift_x;
-        double vy = rj[1] - ri[1] + shift_y;
-        double vz = rj[2] - ri[2] + shift_z;
-        double dist_sq = vx * vx + vy * vy + vz * vz;
+    if (dist_sq < cutoff2) {
+        size_t out = atomicAdd_size_t(length, 1);
+        if (out >= max_pairs) {
+            atomicExch(overflow_flag, 1);
+            return;
+        }
 
-        if (dist_sq < cutoff2) {
-            size_t out = atomicAdd_size_t(length, 1);
-            if (out >= max_pairs) {
-                atomicExch(overflow_flag, 1);
-                continue;
-            }
+        pair_indices[out * 2 + 0] = i;
+        pair_indices[out * 2 + 1] = j;
 
-            pair_indices[out * 2 + 0] = i;
-            pair_indices[out * 2 + 1] = j;
+        if (return_shifts) {
+            shifts_out[out * 3 + 0] = sx;
+            shifts_out[out * 3 + 1] = sy;
+            shifts_out[out * 3 + 2] = sz;
+        }
 
-            if (return_shifts) {
-                shifts_out[out * 3 + 0] = sx;
-                shifts_out[out * 3 + 1] = sy;
-                shifts_out[out * 3 + 2] = sz;
-            }
+        if (return_distances) {
+            distances[out] = sqrt(dist_sq);
+        }
 
-            if (return_distances) {
-                distances[out] = sqrt(dist_sq);
-            }
-
-            if (return_vectors) {
-                vectors[out * 3 + 0] = vx;
-                vectors[out * 3 + 1] = vy;
-                vectors[out * 3 + 2] = vz;
-            }
+        if (return_vectors) {
+            vectors[out * 3 + 0] = vx;
+            vectors[out * 3 + 1] = vy;
+            vectors[out * 3 + 2] = vz;
         }
     }
 }
