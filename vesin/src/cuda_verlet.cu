@@ -263,6 +263,7 @@ __global__ void filter_verlet_candidates(
 
     double cutoff2 = cutoff * cutoff;
     size_t i = 0;
+    size_t prev_i = SIZE_MAX;
     size_t j = 0;
     int sx = 0;
     int sy = 0;
@@ -271,6 +272,7 @@ __global__ void filter_verlet_candidates(
     double vy = 0.0;
     double vz = 0.0;
     double dist_sq = 0.0;
+    const double* ri = nullptr;
 
     i = candidate_pairs[idx * 2 + 0];
     j = candidate_pairs[idx * 2 + 1];
@@ -279,7 +281,10 @@ __global__ void filter_verlet_candidates(
     sy = candidate_shifts[idx * 3 + 1];
     sz = candidate_shifts[idx * 3 + 2];
 
-    const double* ri = &positions[i * 3];
+    if (i != prev_i) {
+        ri = &positions[i * 3];
+        prev_i = i;
+    }
     const double* rj = &positions[j * 3];
 
     double shift_x = sx * box[0] + sy * box[3] + sz * box[6];
