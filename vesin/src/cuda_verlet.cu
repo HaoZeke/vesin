@@ -248,7 +248,7 @@ __global__ void filter_verlet_compact_candidates_block(
     }
 }
 
-__global__ void filter_verlet_candidates(
+__global__ __launch_bounds__(256) void filter_verlet_candidates(
     const double* __restrict__ positions,
     const double* __restrict__ box,
     const size_t* __restrict__ candidate_pairs,
