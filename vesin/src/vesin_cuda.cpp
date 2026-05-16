@@ -316,6 +316,7 @@ static void free_verlet_compact_buffers(CudaNeighborListExtras& extras) {
     extras.verlet_radix_shifts_alt = nullptr;
     extras.verlet_radix_histogram = nullptr;
     extras.verlet_radix_cursor = nullptr;
+    extras.verlet_radix_alt_capacity = 0;
     extras.verlet_candidate_length = 0;
     extras.verlet_compact_candidate_capacity = 0;
     extras.verlet_has_compact_candidates = false;
@@ -816,14 +817,13 @@ static void compact_verlet_candidate_cache(
         // filter only requires i-grouping for ri reuse, not a specific
         // order among pairs sharing an i.
         //
-        // Lazily allocate the ping-pong + histogram + cursor buffers
-        // sized to candidate_length (no power-of-two padding needed).
+        // The ping-pong alt buffer must be at least as big as the compact
+        // buffer (verlet_compact_candidate_capacity). If a previous call
+        // sized it smaller (because candidate_length grew on this system
+        // or after a system-size change), reallocate.
+        size_t alt_cap = extras.verlet_compact_candidate_capacity;
         if (extras.verlet_radix_pairs_alt == nullptr ||
-            extras.verlet_compact_candidate_capacity < candidate_length) {
-            // verlet_compact_candidate_capacity grew already to >= candidate_length
-            // (with next_pow2 padding) above; reuse that capacity for the
-            // alt buffer so we never under-allocate.
-            size_t alt_cap = extras.verlet_compact_candidate_capacity;
+            extras.verlet_radix_alt_capacity < alt_cap) {
             if (extras.verlet_radix_pairs_alt != nullptr) {
                 GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_pairs_alt));
                 extras.verlet_radix_pairs_alt = nullptr;
@@ -836,6 +836,7 @@ static void compact_verlet_candidate_cache(
                                            sizeof(uint32_t) * alt_cap * 2));
             GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_shifts_alt,
                                            sizeof(int32_t) * alt_cap));
+            extras.verlet_radix_alt_capacity = alt_cap;
         }
         if (extras.verlet_radix_histogram == nullptr) {
             GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_histogram,
