@@ -794,6 +794,11 @@ static void compact_verlet_candidate_cache(
     // host-side std::sort with two cudaMemcpy round trips regressed rebuild
     // ~10x at N=32k (see vissue vesin-3okr); replace with an in-place
     // bitonic sort that runs entirely on device.
+    //
+    // Compile-time toggle for profiling: define
+    // VESIN_DISABLE_COMPACT_SORT to skip the sort entirely and measure how
+    // much the cell-list's natural (almost-sorted-by-i) order is worth.
+#ifndef VESIN_DISABLE_COMPACT_SORT
     if (candidate_length > 1) {
         size_t sort_capacity = next_power_of_two(candidate_length);
         // ensure_verlet_compact_buffers already over-allocates to
@@ -859,6 +864,7 @@ static void compact_verlet_candidate_cache(
         // hold the UINT_MAX sentinels and are ignored by the filter kernel
         // (which uses candidate_length as its loop bound).
     }
+#endif // VESIN_DISABLE_COMPACT_SORT
 
     extras.verlet_has_compact_candidates = true;
     if (extras.verlet_candidates.device.type == VesinCUDA) {
