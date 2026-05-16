@@ -1,3 +1,14 @@
+// Algorithm-inherent radix sort constants. NOT device properties --
+// these come from the choice to use an 8-bit radix on 32-bit keys
+// (uint32 candidate first-particle index). The host launch grid and
+// the kernels' shared-memory arrays both have to agree on
+// VESIN_RADIX_BUCKETS. If you change VESIN_RADIX_BITS, mirror the
+// change in the host code (radix_passes loop bound + sort-time
+// shift mask).
+#define VESIN_RADIX_BITS 8
+#define VESIN_RADIX_BUCKETS (1 << VESIN_RADIX_BITS)
+#define VESIN_RADIX_PASSES (32 / VESIN_RADIX_BITS)
+
 __device__ inline size_t atomicAdd_size_t(size_t* address, size_t val) {
     unsigned long long* address_as_ull = reinterpret_cast<unsigned long long*>(address);
     return static_cast<size_t>(atomicAdd(address_as_ull, static_cast<unsigned long long>(val)));
@@ -112,7 +123,7 @@ __global__ void zero_radix_buffers(
         return;
     }
     int tid = threadIdx.x;
-    if (tid < 256) {
+    if (tid < VESIN_RADIX_BUCKETS) {
         histogram[tid] = 0;
         cursor[tid] = 0;
     }
@@ -127,22 +138,23 @@ __global__ void radix_histogram(
     unsigned int shift_bits,
     int* __restrict__ histogram
 ) {
-    __shared__ unsigned int local[256];
-    if (threadIdx.x < 256) {
+    __shared__ unsigned int local[VESIN_RADIX_BUCKETS];
+    if (threadIdx.x < VESIN_RADIX_BUCKETS) {
         local[threadIdx.x] = 0;
     }
     __syncthreads();
 
+    const unsigned int bucket_mask = VESIN_RADIX_BUCKETS - 1u;
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < length;
          idx += blockDim.x * gridDim.x) {
         unsigned int key = pairs[idx * 2 + 0];
-        unsigned int bucket = (key >> shift_bits) & 0xFFu;
+        unsigned int bucket = (key >> shift_bits) & bucket_mask;
         atomicAdd(&local[bucket], 1u);
     }
     __syncthreads();
 
-    if (threadIdx.x < 256 && local[threadIdx.x] != 0) {
+    if (threadIdx.x < VESIN_RADIX_BUCKETS && local[threadIdx.x] != 0) {
         atomicAdd(&histogram[threadIdx.x],
                   static_cast<int>(local[threadIdx.x]));
     }
@@ -152,30 +164,30 @@ __global__ void radix_histogram(
 // histogram (a single CUDA block of 256 threads is enough). Writes the
 // exclusive prefix in place so the scatter pass sees bucket-start
 // offsets.
-__global__ void radix_prefix_sum_256(int* __restrict__ histogram) {
+__global__ void radix_prefix_sum_buckets(int* __restrict__ histogram) {
     if (blockIdx.x != 0) {
         return; // single-block kernel
     }
-    __shared__ int s[256];
+    __shared__ int s[VESIN_RADIX_BUCKETS];
     int tid = threadIdx.x;
-    if (tid < 256) {
+    if (tid < VESIN_RADIX_BUCKETS) {
         s[tid] = histogram[tid];
     }
     __syncthreads();
 
     // Hillis-Steele inclusive scan.
-    for (int off = 1; off < 256; off <<= 1) {
+    for (int off = 1; off < VESIN_RADIX_BUCKETS; off <<= 1) {
         int v = 0;
-        if (tid >= off && tid < 256) {
+        if (tid >= off && tid < VESIN_RADIX_BUCKETS) {
             v = s[tid - off];
         }
         __syncthreads();
-        if (tid < 256) {
+        if (tid < VESIN_RADIX_BUCKETS) {
             s[tid] += v;
         }
         __syncthreads();
     }
-    if (tid < 256) {
+    if (tid < VESIN_RADIX_BUCKETS) {
         int exclusive = (tid == 0) ? 0 : s[tid - 1];
         histogram[tid] = exclusive;
     }
@@ -196,13 +208,14 @@ __global__ void radix_scatter(
     const int* __restrict__ prefix,
     int* __restrict__ bucket_cursor
 ) {
+    const unsigned int bucket_mask = VESIN_RADIX_BUCKETS - 1u;
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < length;
          idx += blockDim.x * gridDim.x) {
         unsigned int p0 = in_pairs[idx * 2 + 0];
         unsigned int p1 = in_pairs[idx * 2 + 1];
         int ps = in_shifts[idx];
-        unsigned int bucket = (p0 >> shift_bits) & 0xFFu;
+        unsigned int bucket = (p0 >> shift_bits) & bucket_mask;
         int slot = atomicAdd(&bucket_cursor[bucket], 1);
         int dst = prefix[bucket] + slot;
         out_pairs[dst * 2 + 0] = p0;
@@ -314,16 +327,16 @@ __global__ void filter_verlet_compact_candidates(
     }
 }
 
-// __launch_bounds__(BLOCK, MIN_BLOCKS_PER_SM): tell ptxas to target at
-// least MIN_BLOCKS_PER_SM blocks/SM, which caps register-per-thread to
-// (65536 / (BLOCK * MIN_BLOCKS_PER_SM)) on CC 8.9. ncu showed the
-// kernel unconstrained at 54 reg/thread -> 4 blocks/SM -> 66.67%
-// theoretical occupancy (61.94% achieved). With (256, 8): cap is
-// 65536/(256*8) = 32 reg/thread, theoretical occupancy 100%. PTXAS
-// will spill the extra registers to local memory; the trade is more
-// load/store traffic for hidden latency. Re-profile mem throughput
-// after any change.
-__global__ void __launch_bounds__(256, 8) filter_verlet_compact_candidates_block(
+// __launch_bounds__ deliberately omitted: ncu showed the (256, 8)
+// variant trimmed regs/thread 54 -> 48 and lifted theoretical
+// occupancy 66.67% -> 83.33%, but kernel duration stayed at 23.7 us
+// (same as unconstrained) because the kernel is compute-bound at
+// ~64% SM throughput, not memory-latency-bound. The right device-
+// derived bound would come from querying gpulite
+// (cuDeviceGetAttribute MAX_THREADS_PER_MULTIPROCESSOR /
+// MAX_REGISTERS_PER_MULTIPROCESSOR) and passing the result as an
+// NVRTC compile flag; see perf-decisions.org for the deferred plan.
+__global__ void filter_verlet_compact_candidates_block(
     const double* __restrict__ positions,
     const double* __restrict__ box,
     const unsigned int* __restrict__ candidate_pairs,

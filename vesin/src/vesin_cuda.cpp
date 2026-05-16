@@ -55,6 +55,21 @@ static constexpr size_t DEFAULT_MAX_CELLS = 8192;
 static constexpr size_t MIN_PARTICLES_PER_CELL = 8;
 static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 1024;  // lowered so the efficient block-compact + sorted path is used even in medium-size profiling runs (real hotspot data)
 
+// Radix-sort algorithm constants. NOT device properties -- these come
+// from the choice to use an 8-bit radix on uint32 candidate keys.
+// Must agree with VESIN_RADIX_BITS in cuda_verlet.cu.
+static constexpr int VESIN_RADIX_BITS = 8;
+static constexpr int VESIN_RADIX_BUCKETS = 1 << VESIN_RADIX_BITS;
+static constexpr int VESIN_RADIX_PASSES = 32 / VESIN_RADIX_BITS;
+
+// Default kernel block size used by the bitonic-sort + radix-sort
+// launches in compact_verlet_candidate_cache. A device-aware version
+// would query gpulite for warp size and pick warp_size * 8; the value
+// below assumes a 32-thread warp and 8 warps/block, which is the
+// configuration every CC >= 6.0 GPU supports. perf-decisions.org has
+// the deferred plan for the device-query refactor.
+static constexpr size_t VESIN_DEFAULT_BLOCK_SIZE = 256;
+
 // Helper functions for CPU-side vector math
 static inline double cpu_dot3(const double* a, const double* b) {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -851,11 +866,11 @@ static void compact_verlet_candidate_cache(
         }
         if (extras.verlet_radix_histogram == nullptr) {
             GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_histogram,
-                                           sizeof(int32_t) * 256));
+                                           sizeof(int32_t) * VESIN_RADIX_BUCKETS));
         }
         if (extras.verlet_radix_cursor == nullptr) {
             GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_cursor,
-                                           sizeof(int32_t) * 256));
+                                           sizeof(int32_t) * VESIN_RADIX_BUCKETS));
         }
 
         auto* zero_kernel = factory.create(
@@ -871,7 +886,7 @@ static void compact_verlet_candidate_cache(
             {"-std=c++17", "-default-device"}
         );
         auto* prefix_kernel = factory.create(
-            "radix_prefix_sum_256",
+            "radix_prefix_sum_buckets",
             cuda_verlet_code,
             "cuda_verlet.cu",
             {"-std=c++17", "-default-device"}
@@ -883,7 +898,7 @@ static void compact_verlet_candidate_cache(
             {"-std=c++17", "-default-device"}
         );
 
-        const size_t threads = 256;
+        const size_t threads = VESIN_DEFAULT_BLOCK_SIZE;
         const size_t blocks = std::max(
             (candidate_length + threads - 1) / threads,
             static_cast<size_t>(1)
@@ -896,19 +911,19 @@ static void compact_verlet_candidate_cache(
         int32_t* d_histogram = extras.verlet_radix_histogram;
         int32_t* d_cursor = extras.verlet_radix_cursor;
 
-        for (unsigned int pass = 0; pass < 4; ++pass) {
-            unsigned int shift_bits = pass * 8u;
+        for (unsigned int pass = 0; pass < VESIN_RADIX_PASSES; ++pass) {
+            unsigned int shift_bits = pass * VESIN_RADIX_BITS;
 
             // One zero-kernel launch instead of two sync cudaMemset(0)
             // calls per pass (saves ~40 us of sync-point latency per
-            // rebuild across 4 passes). Single block of 256 threads
-            // clears both 256-int arrays.
+            // rebuild across all VESIN_RADIX_PASSES). Single block of
+            // VESIN_RADIX_BUCKETS threads clears both buckets arrays.
             std::vector<void*> zero_args = {
                 static_cast<void*>(&d_histogram),
                 static_cast<void*>(&d_cursor),
             };
             zero_kernel->launch(
-                dim3(1), dim3(256), 0, nullptr, zero_args, false
+                dim3(1), dim3(VESIN_RADIX_BUCKETS), 0, nullptr, zero_args, false
             );
 
             std::vector<void*> hist_args = {
@@ -925,7 +940,7 @@ static void compact_verlet_candidate_cache(
                 static_cast<void*>(&d_histogram),
             };
             prefix_kernel->launch(
-                dim3(1), dim3(256), 0, nullptr, prefix_args, false
+                dim3(1), dim3(VESIN_RADIX_BUCKETS), 0, nullptr, prefix_args, false
             );
 
             std::vector<void*> scatter_args = {
@@ -987,7 +1002,7 @@ static void compact_verlet_candidate_cache(
             {"-std=c++17", "-default-device"}
         );
 
-        const size_t sort_threads = 256;
+        const size_t sort_threads = VESIN_DEFAULT_BLOCK_SIZE;
         const size_t sort_blocks = std::max(
             (sort_capacity + sort_threads - 1) / sort_threads,
             static_cast<size_t>(1)
