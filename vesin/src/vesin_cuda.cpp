@@ -810,6 +810,17 @@ static void compact_verlet_candidate_cache(
     // launch chain on rebuild, but the gpu sort is also cheap enough that
     // the default keeps it on.
 #ifndef VESIN_DISABLE_COMPACT_SORT
+    // Two implementations live in this file. The bitonic chain ships as
+    // default after the May 2026 head-to-head bench on rg.cosmolab
+    // (Software/Metatomic/vesin_bench_plots/perf-decisions.org):
+    // both produce equivalent sort quality for the downstream filter,
+    // and the bitonic launches are individually small enough that the
+    // ~1880-launch count is not the bottleneck it looks like in ncu --
+    // the radix sort's extra cudaMemset sync points + DtoD copy on
+    // odd-parity passes eat the launch-count savings on wall clock.
+    // Define VESIN_USE_RADIX_SORT to switch back to the radix path for
+    // experiments.
+#ifdef VESIN_USE_RADIX_SORT
     if (candidate_length > 1) {
         // 4-pass 8-bit radix sort. Replaces the previous bitonic sort
         // chain (~1880 launches / rebuild at N=8192) with 12 launches
@@ -940,6 +951,60 @@ static void compact_verlet_candidate_cache(
             ));
         }
     }
+#else // !VESIN_USE_RADIX_SORT -> bitonic default
+    if (candidate_length > 1) {
+        size_t sort_capacity = next_power_of_two(candidate_length);
+        // ensure_verlet_compact_buffers already over-allocates to
+        // next_power_of_two so the pad+sort can write past
+        // candidate_length safely.
+
+        auto* pad_kernel = factory.create(
+            "pad_compact_candidates",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        auto* sort_kernel = factory.create(
+            "sort_compact_candidates_bitonic_step",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        const size_t sort_threads = 256;
+        const size_t sort_blocks = std::max(
+            (sort_capacity + sort_threads - 1) / sort_threads,
+            static_cast<size_t>(1)
+        );
+
+        std::vector<void*> pad_args = {
+            static_cast<void*>(&d_compact_pairs),
+            static_cast<void*>(&d_compact_shifts),
+            static_cast<void*>(&candidate_length),
+            static_cast<void*>(&sort_capacity),
+        };
+        pad_kernel->launch(
+            dim3(sort_blocks), dim3(sort_threads), 0, nullptr, pad_args, false
+        );
+
+        for (size_t k = 2; k <= sort_capacity; k <<= 1) {
+            for (size_t j = k >> 1; j > 0; j >>= 1) {
+                std::vector<void*> step_args = {
+                    static_cast<void*>(&d_compact_pairs),
+                    static_cast<void*>(&d_compact_shifts),
+                    static_cast<void*>(&sort_capacity),
+                    static_cast<void*>(&j),
+                    static_cast<void*>(&k),
+                };
+                sort_kernel->launch(
+                    dim3(sort_blocks), dim3(sort_threads), 0, nullptr,
+                    step_args, false
+                );
+            }
+        }
+    }
+#endif // VESIN_USE_RADIX_SORT
 #endif // VESIN_DISABLE_COMPACT_SORT
 
     extras.verlet_has_compact_candidates = true;
