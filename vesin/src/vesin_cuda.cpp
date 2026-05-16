@@ -807,6 +807,54 @@ static void compact_verlet_candidate_cache(
         // next_power_of_two, so the pad+sort can write past
         // candidate_length safely.
 
+        // Fast-path: cell-list candidate output is usually almost
+        // monotonic in the first particle index because the cell scan +
+        // per-warp scatter preserves cell ordering. Run a one-pass
+        // is-sorted check kernel and skip the O(log^2 N) bitonic
+        // launches when it passes. Profiling on rg.cosmolab showed the
+        // bitonic chain firing ~1880 times per rebuild at N=8192 and
+        // dominating rebuild wall-clock; skipping it when unnecessary
+        // is the largest single win on the rebuild path.
+        GPULITE_CUDART_CALL(cudaMemset(d_overflow_flag, 0, sizeof(int32_t)));
+        auto* check_sorted_kernel = factory.create(
+            "check_compact_candidates_sorted",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        const size_t check_threads = 256;
+        const size_t check_blocks = std::max(
+            (candidate_length + check_threads - 1) / check_threads,
+            static_cast<size_t>(1)
+        );
+        std::vector<void*> check_args = {
+            static_cast<void*>(&d_compact_pairs),
+            static_cast<void*>(&candidate_length),
+            static_cast<void*>(&d_overflow_flag),
+        };
+        check_sorted_kernel->launch(
+            dim3(check_blocks),
+            dim3(check_threads),
+            0,
+            nullptr,
+            check_args,
+            false
+        );
+        int32_t h_unsorted = 0;
+        GPULITE_CUDART_CALL(cudaMemcpy(
+            &h_unsorted, d_overflow_flag, sizeof(int32_t),
+            cudaMemcpyDeviceToHost
+        ));
+        if (h_unsorted == 0) {
+            // Already sorted: skip the bitonic launches entirely.
+            extras.verlet_has_compact_candidates = true;
+            if (extras.verlet_candidates.device.type == VesinCUDA) {
+                free_neighbors(extras.verlet_candidates);
+                extras.verlet_candidates = VesinNeighborList();
+            }
+            return;
+        }
+
         auto* pad_kernel = factory.create(
             "pad_compact_candidates",
             cuda_verlet_code,
@@ -905,7 +953,12 @@ static bool verlet_needs_rebuild(
         {"-std=c++17", "-default-device"}
     );
 
-    size_t threads = 256;
+    // check_verlet_displacements is a tiny 10-instruction kernel that fires
+    // on every reuse call. ncu showed it ran at ~14% achieved occupancy
+    // with threads=256 (grid size 32 at N=8192), because too few blocks
+    // covered too few SMs on the RTX 4070 Ti SUPER (66 SMs). Drop the
+    // block size to 64 so the grid expands 4x and more SMs see work.
+    size_t threads = 64;
     size_t blocks = (n_points + threads - 1) / threads;
     auto* d_ref_positions = extras.verlet_ref_positions;
     auto* d_rebuild_flag = extras.verlet_rebuild_flag;
