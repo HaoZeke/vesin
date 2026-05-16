@@ -905,12 +905,16 @@ static bool verlet_needs_rebuild(
         {"-std=c++17", "-default-device"}
     );
 
-    // check_verlet_displacements is a tiny 10-instruction kernel that fires
-    // on every reuse call. ncu showed it ran at ~14% achieved occupancy
-    // with threads=256 (grid size 32 at N=8192), because too few blocks
-    // covered too few SMs on the RTX 4070 Ti SUPER (66 SMs). Drop the
-    // block size to 64 so the grid expands 4x and more SMs see work.
-    size_t threads = 64;
+    // check_verlet_displacements fires on every reuse call. ncu showed
+    // it at ~14% achieved occupancy with threads=256 (grid size 32 at
+    // N=8192) -- too few blocks to cover all 66 SMs on the RTX 4070 Ti
+    // SUPER. Dropping threads to 64 quadrupled the grid but achieved
+    // occupancy actually fell to ~7% (the kernel is hardware-limited at
+    // 24 blocks/SM x 2 warps = 48 warps/SM, so the SMs that DO get
+    // blocks are already saturated and the new blocks don't help).
+    // Kernel duration is 3 us either way -- not worth optimising
+    // further at this size. Keeping the original 256.
+    size_t threads = 256;
     size_t blocks = (n_points + threads - 1) / threads;
     auto* d_ref_positions = extras.verlet_ref_positions;
     auto* d_rebuild_flag = extras.verlet_rebuild_flag;
