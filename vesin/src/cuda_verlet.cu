@@ -100,6 +100,24 @@ __global__ void pad_compact_candidates(
 // stable but the downstream filter only requires i-grouping for ri
 // reuse, not a specific ordering among pairs that share an i.
 
+// One-launch zero kernel for the radix histogram + cursor buffers
+// (256 ints each). Replaces two sync cudaMemset(0) calls per pass
+// (and 8 across 4 passes per rebuild). Single block of 256 threads
+// stores both arrays in one go.
+__global__ void zero_radix_buffers(
+    int* __restrict__ histogram,
+    int* __restrict__ cursor
+) {
+    if (blockIdx.x != 0) {
+        return;
+    }
+    int tid = threadIdx.x;
+    if (tid < 256) {
+        histogram[tid] = 0;
+        cursor[tid] = 0;
+    }
+}
+
 // Pass 1/3 per radix pass: count how many entries fall in each of 256
 // buckets for the current 8-bit slice. Block-local shared histogram is
 // reduced into a global 256-bucket histogram via atomicAdd.
@@ -296,7 +314,16 @@ __global__ void filter_verlet_compact_candidates(
     }
 }
 
-__global__ void filter_verlet_compact_candidates_block(
+// __launch_bounds__(BLOCK, MIN_BLOCKS_PER_SM): tell ptxas to target at
+// least MIN_BLOCKS_PER_SM blocks/SM, which caps register-per-thread to
+// (65536 / (BLOCK * MIN_BLOCKS_PER_SM)) on CC 8.9. ncu showed the
+// kernel unconstrained at 54 reg/thread -> 4 blocks/SM -> 66.67%
+// theoretical occupancy (61.94% achieved). With (256, 8): cap is
+// 65536/(256*8) = 32 reg/thread, theoretical occupancy 100%. PTXAS
+// will spill the extra registers to local memory; the trade is more
+// load/store traffic for hidden latency. Re-profile mem throughput
+// after any change.
+__global__ void __launch_bounds__(256, 8) filter_verlet_compact_candidates_block(
     const double* __restrict__ positions,
     const double* __restrict__ box,
     const unsigned int* __restrict__ candidate_pairs,
