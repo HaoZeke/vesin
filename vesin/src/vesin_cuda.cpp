@@ -795,9 +795,11 @@ static void compact_verlet_candidate_cache(
     // ~10x at N=32k (see vissue vesin-3okr); replace with an in-place
     // bitonic sort that runs entirely on device.
     //
-    // Compile-time toggle for profiling: define
-    // VESIN_DISABLE_COMPACT_SORT to skip the sort entirely and measure how
-    // much the cell-list's natural (almost-sorted-by-i) order is worth.
+    // Compile-time toggle for profiling: pass -DVESIN_DISABLE_COMPACT_SORT
+    // to skip the sort entirely. Empirically (see vissue vesin-3okr data)
+    // disabling the sort keeps reuse perf within ~5% while saving the sort
+    // launch chain on rebuild, but the gpu sort is also cheap enough that
+    // the default keeps it on.
 #ifndef VESIN_DISABLE_COMPACT_SORT
     if (candidate_length > 1) {
         size_t sort_capacity = next_power_of_two(candidate_length);
