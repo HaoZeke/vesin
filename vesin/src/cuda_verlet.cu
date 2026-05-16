@@ -267,6 +267,10 @@ __global__ void filter_verlet_compact_candidates_block(
         }
         __syncthreads();
 
+        // Single thread does the prefix sum across warps AND the
+        // block-wide atomicAdd so we only pay one __syncthreads barrier
+        // instead of two. block_base is published via the same shared
+        // memory so the if(keep) phase below picks it up after sync.
         if (threadIdx.x == 0) {
             unsigned running = 0;
             for (int slot = 0; slot < warp_count_slots; slot++) {
@@ -275,11 +279,7 @@ __global__ void filter_verlet_compact_candidates_block(
                 running += count;
             }
             warp_offsets[warp_count_slots] = running;
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            block_base = warp_offsets[warp_count_slots] == 0 ? 0 : atomicAdd_size_t(length, warp_offsets[warp_count_slots]);
+            block_base = (running == 0) ? 0 : atomicAdd_size_t(length, running);
         }
         __syncthreads();
 
