@@ -86,21 +86,20 @@ struct VesinGpuProperties {
 static const VesinGpuProperties& gpu_properties() {
     static const VesinGpuProperties props = []() {
         VesinGpuProperties p{};
-        auto& driver = gpulite::CUDADriver::instance();
         CUdevice dev = 0;
-        GPULITE_CUDA_DRIVER_CALL(driver.cuCtxGetDevice(&dev));
-        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+        GPULITE_CUDA_DRIVER_CALL(cuCtxGetDevice(&dev));
+        GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.warp_size, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev));
-        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+        GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.max_threads_per_block,
             static_cast<CUdevice_attribute>(1), dev));
-        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+        GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.multiprocessor_count,
             static_cast<CUdevice_attribute>(16), dev));
-        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+        GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.max_threads_per_multiprocessor,
             static_cast<CUdevice_attribute>(39), dev));
-        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+        GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.max_registers_per_multiprocessor,
             static_cast<CUdevice_attribute>(82), dev));
         return p;
