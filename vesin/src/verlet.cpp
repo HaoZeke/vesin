@@ -200,7 +200,9 @@ static void filter_simd_candidate_blocks(
     alignas(64) double dy[CLUSTER_SIZE_CPU];
     alignas(64) double dz[CLUSTER_SIZE_CPU];
     alignas(64) double dist_sq[CLUSTER_SIZE_CPU];
+    alignas(64) double dist[CLUSTER_SIZE_CPU];
     uint8_t mask[CLUSTER_SIZE_CPU];
+    const bool need_distance = options.return_distances;
 
     for (const auto& block : blocks) {
         // Vectorized gather + arithmetic for the valid lanes (uses Highway Gather
@@ -227,6 +229,19 @@ static void filter_simd_candidate_blocks(
 
         simd_filter_deltas(dx, dy, dz, cutoff_sq, dist_sq, mask);
 
+        // SIMD sqrt: precompute once for the whole block instead of one
+        // scalar std::sqrt per kept pair in the lane loop. Highway picks
+        // the widest available vector lane (AVX-512: 8 doubles, AVX2: 4).
+        // Wasted lanes for filtered-out pairs are cheap relative to the
+        // scalar loop overhead. Only run when distances are requested.
+        if (need_distance) {
+            const hn::ScalableTag<double> d;
+            const size_t N = hn::Lanes(d);
+            for (size_t lane = 0; lane < CLUSTER_SIZE_CPU; lane += N) {
+                hn::Store(hn::Sqrt(hn::Load(d, dist_sq + lane)), d, dist + lane);
+            }
+        }
+
         // Pre-grow once per block. Worst case is every lane in this block
         // passes the filter, so reserve growable.length() + block.count up
         // front. This hoists the per-pair capacity branch out of the hot
@@ -247,8 +262,8 @@ static void filter_simd_candidate_blocks(
                 growable.set_shift_unchecked(index, block.shifts[lane]);
             }
 
-            if (options.return_distances) {
-                growable.set_distance_unchecked(index, std::sqrt(dist_sq[lane]));
+            if (need_distance) {
+                growable.set_distance_unchecked(index, dist[lane]);
             }
 
             if (options.return_vectors) {
