@@ -30,6 +30,68 @@ __device__ inline int unpack_verlet_shift(int packed, int offset) {
     return value >= 512 ? value - 1024 : value;
 }
 
+// Bitonic compare-exchange step that sorts the compact candidate cache in
+// place by the first particle index (pairs[2*idx]). The sort is launched
+// log2(next_pow2(candidate_length))^2 / 2 times by the host code.
+//
+// Pre-condition: pairs+shifts are padded out to next_power_of_two with a
+// sentinel where the first key is UINT_MAX (handled by the host before the
+// first step). pad_compact_candidates below installs that sentinel.
+__global__ void sort_compact_candidates_bitonic_step(
+    unsigned int* __restrict__ pairs,
+    int* __restrict__ shifts,
+    size_t sort_capacity,
+    size_t j,
+    size_t k
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= sort_capacity) {
+        return;
+    }
+
+    size_t ixj = idx ^ j;
+    if (ixj <= idx || ixj >= sort_capacity) {
+        return;
+    }
+
+    bool ascending = ((idx & k) == 0);
+    unsigned int ai = pairs[idx * 2 + 0];
+    unsigned int bi = pairs[ixj * 2 + 0];
+    bool idx_less = ai < bi;
+    bool should_swap = ascending ? !idx_less : idx_less;
+
+    if (should_swap) {
+        unsigned int a0 = pairs[idx * 2 + 0];
+        unsigned int a1 = pairs[idx * 2 + 1];
+        pairs[idx * 2 + 0] = pairs[ixj * 2 + 0];
+        pairs[idx * 2 + 1] = pairs[ixj * 2 + 1];
+        pairs[ixj * 2 + 0] = a0;
+        pairs[ixj * 2 + 1] = a1;
+        int sa = shifts[idx];
+        shifts[idx] = shifts[ixj];
+        shifts[ixj] = sa;
+    }
+}
+
+// Pad the compact candidate cache from `length` up to `capacity` with a
+// sentinel that sorts to the end of the bitonic sequence (pair[0] = UINT_MAX).
+// The shift value of the padding entries is irrelevant because the host
+// truncates back to `length` after the sort.
+__global__ void pad_compact_candidates(
+    unsigned int* __restrict__ pairs,
+    int* __restrict__ shifts,
+    size_t length,
+    size_t capacity
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < length || idx >= capacity) {
+        return;
+    }
+    pairs[idx * 2 + 0] = 0xFFFFFFFFu;
+    pairs[idx * 2 + 1] = 0xFFFFFFFFu;
+    shifts[idx] = 0;
+}
+
 __global__ void pack_verlet_candidates(
     const size_t* __restrict__ candidate_pairs,
     const int* __restrict__ candidate_shifts,

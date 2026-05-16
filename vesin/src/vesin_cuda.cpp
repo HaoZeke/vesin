@@ -708,13 +708,15 @@ static void ensure_verlet_ref_buffers(CudaNeighborListExtras& extras, size_t n_p
 }
 
 static void ensure_verlet_compact_buffers(CudaNeighborListExtras& extras, size_t candidate_length) {
-    auto capacity = std::max(candidate_length, static_cast<size_t>(1));
-    if (extras.verlet_compact_candidate_capacity < capacity) {
+    // Bitonic sort needs the buffer padded out to the next power of two so
+    // every compare-exchange has a valid partner index. Allocate up front.
+    auto needed = std::max(next_power_of_two(candidate_length), static_cast<size_t>(1));
+    if (extras.verlet_compact_candidate_capacity < needed) {
         free_verlet_compact_buffers(extras);
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_pairs, sizeof(uint32_t) * capacity * 2));
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_shifts, sizeof(int32_t) * capacity));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_pairs, sizeof(uint32_t) * needed * 2));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_shifts, sizeof(int32_t) * needed));
         GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_overflow_flag, sizeof(int32_t)));
-        extras.verlet_compact_candidate_capacity = capacity;
+        extras.verlet_compact_candidate_capacity = needed;
     }
 
     if (extras.verlet_compact_overflow_flag == nullptr) {
@@ -785,34 +787,77 @@ static void compact_verlet_candidate_cache(
         return;
     }
 
-    // Algorithmic optimization: sort the compact Verlet candidates by the first particle index (i).
-    // This gives the subsequent filter kernel (filter_verlet_*) much better temporal locality
-    // on the random gathers from the positions array, dramatically improving cache hit rate
-    // and "active threads per warp" in the hot filter path. This is the real hotspot
-    // identified by ncu on non-trivial candidate lists.
-    {
-        std::vector<uint32_t> h_pairs(candidate_length * 2);
-        std::vector<int32_t> h_shifts(candidate_length);
-        GPULITE_CUDART_CALL(cudaMemcpy(h_pairs.data(), d_compact_pairs, sizeof(uint32_t) * candidate_length * 2, cudaMemcpyDeviceToHost));
-        GPULITE_CUDART_CALL(cudaMemcpy(h_shifts.data(), d_compact_shifts, sizeof(int32_t) * candidate_length, cudaMemcpyDeviceToHost));
+    // Sort the compact Verlet candidates by the first particle index (i) so
+    // the subsequent filter kernel gets good temporal locality on positions
+    // gathers and the ri-reuse hits in
+    // filter_verlet_compact_candidates_block actually fire. The earlier
+    // host-side std::sort with two cudaMemcpy round trips regressed rebuild
+    // ~10x at N=32k (see vissue vesin-3okr); replace with an in-place
+    // bitonic sort that runs entirely on device.
+    if (candidate_length > 1) {
+        size_t sort_capacity = next_power_of_two(candidate_length);
+        // ensure_verlet_compact_buffers already over-allocates to
+        // next_power_of_two, so the pad+sort can write past
+        // candidate_length safely.
 
-        std::vector<size_t> order(candidate_length);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            return h_pairs[a * 2] < h_pairs[b * 2];
-        });
+        auto* pad_kernel = factory.create(
+            "pad_compact_candidates",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
 
-        std::vector<uint32_t> sorted_pairs(candidate_length * 2);
-        std::vector<int32_t> sorted_shifts(candidate_length);
-        for (size_t k = 0; k < candidate_length; ++k) {
-            size_t src = order[k];
-            sorted_pairs[k * 2 + 0] = h_pairs[src * 2 + 0];
-            sorted_pairs[k * 2 + 1] = h_pairs[src * 2 + 1];
-            sorted_shifts[k] = h_shifts[src];
+        auto* sort_kernel = factory.create(
+            "sort_compact_candidates_bitonic_step",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        const size_t sort_threads = 256;
+        const size_t sort_blocks = std::max(
+            (sort_capacity + sort_threads - 1) / sort_threads,
+            static_cast<size_t>(1)
+        );
+
+        std::vector<void*> pad_args = {
+            static_cast<void*>(&d_compact_pairs),
+            static_cast<void*>(&d_compact_shifts),
+            static_cast<void*>(&candidate_length),
+            static_cast<void*>(&sort_capacity),
+        };
+        pad_kernel->launch(
+            dim3(sort_blocks),
+            dim3(sort_threads),
+            0,
+            nullptr,
+            pad_args,
+            false
+        );
+
+        for (size_t k = 2; k <= sort_capacity; k <<= 1) {
+            for (size_t j = k >> 1; j > 0; j >>= 1) {
+                std::vector<void*> step_args = {
+                    static_cast<void*>(&d_compact_pairs),
+                    static_cast<void*>(&d_compact_shifts),
+                    static_cast<void*>(&sort_capacity),
+                    static_cast<void*>(&j),
+                    static_cast<void*>(&k),
+                };
+                sort_kernel->launch(
+                    dim3(sort_blocks),
+                    dim3(sort_threads),
+                    0,
+                    nullptr,
+                    step_args,
+                    false
+                );
+            }
         }
-
-        GPULITE_CUDART_CALL(cudaMemcpy(d_compact_pairs, sorted_pairs.data(), sizeof(uint32_t) * candidate_length * 2, cudaMemcpyHostToDevice));
-        GPULITE_CUDART_CALL(cudaMemcpy(d_compact_shifts, sorted_shifts.data(), sizeof(int32_t) * candidate_length, cudaMemcpyHostToDevice));
+        // After sort, the first `candidate_length` entries are the actual
+        // candidates (sorted); the remaining entries up to sort_capacity
+        // hold the UINT_MAX sentinels and are ignored by the filter kernel
+        // (which uses candidate_length as its loop bound).
     }
 
     extras.verlet_has_compact_candidates = true;
