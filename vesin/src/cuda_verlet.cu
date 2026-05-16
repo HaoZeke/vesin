@@ -92,6 +92,107 @@ __global__ void pad_compact_candidates(
     shifts[idx] = 0;
 }
 
+// 4-pass 8-bit radix sort kernels for the compact candidate cache. The
+// bitonic sort above takes O(log^2 N) kernel launches and was dominated
+// by kernel launch overhead on small partner distances; ncu showed
+// ~1880 bitonic launches per rebuild at N=8192. Radix needs 3 kernel
+// launches per pass, so 4 passes -> 12 launches total. The sort is NOT
+// stable but the downstream filter only requires i-grouping for ri
+// reuse, not a specific ordering among pairs that share an i.
+
+// Pass 1/3 per radix pass: count how many entries fall in each of 256
+// buckets for the current 8-bit slice. Block-local shared histogram is
+// reduced into a global 256-bucket histogram via atomicAdd.
+__global__ void radix_histogram(
+    const unsigned int* __restrict__ pairs,
+    size_t length,
+    unsigned int shift_bits,
+    int* __restrict__ histogram
+) {
+    __shared__ unsigned int local[256];
+    if (threadIdx.x < 256) {
+        local[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < length;
+         idx += blockDim.x * gridDim.x) {
+        unsigned int key = pairs[idx * 2 + 0];
+        unsigned int bucket = (key >> shift_bits) & 0xFFu;
+        atomicAdd(&local[bucket], 1u);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 256 && local[threadIdx.x] != 0) {
+        atomicAdd(&histogram[threadIdx.x],
+                  static_cast<int>(local[threadIdx.x]));
+    }
+}
+
+// Pass 2/3 per radix pass: exclusive prefix sum on the 256-bucket
+// histogram (a single CUDA block of 256 threads is enough). Writes the
+// exclusive prefix in place so the scatter pass sees bucket-start
+// offsets.
+__global__ void radix_prefix_sum_256(int* __restrict__ histogram) {
+    if (blockIdx.x != 0) {
+        return; // single-block kernel
+    }
+    __shared__ int s[256];
+    int tid = threadIdx.x;
+    if (tid < 256) {
+        s[tid] = histogram[tid];
+    }
+    __syncthreads();
+
+    // Hillis-Steele inclusive scan.
+    for (int off = 1; off < 256; off <<= 1) {
+        int v = 0;
+        if (tid >= off && tid < 256) {
+            v = s[tid - off];
+        }
+        __syncthreads();
+        if (tid < 256) {
+            s[tid] += v;
+        }
+        __syncthreads();
+    }
+    if (tid < 256) {
+        int exclusive = (tid == 0) ? 0 : s[tid - 1];
+        histogram[tid] = exclusive;
+    }
+}
+
+// Pass 3/3 per radix pass: each thread reads its (key, payload) tuple,
+// extracts the 8-bit slice, atomicAdds to a per-bucket cursor to claim
+// its output slot, and writes to the output buffers at
+// (prefix[bucket] + slot). The bucket_cursor buffer must be cleared to
+// 0 by the host before each pass.
+__global__ void radix_scatter(
+    const unsigned int* __restrict__ in_pairs,
+    const int* __restrict__ in_shifts,
+    unsigned int* __restrict__ out_pairs,
+    int* __restrict__ out_shifts,
+    size_t length,
+    unsigned int shift_bits,
+    const int* __restrict__ prefix,
+    int* __restrict__ bucket_cursor
+) {
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < length;
+         idx += blockDim.x * gridDim.x) {
+        unsigned int p0 = in_pairs[idx * 2 + 0];
+        unsigned int p1 = in_pairs[idx * 2 + 1];
+        int ps = in_shifts[idx];
+        unsigned int bucket = (p0 >> shift_bits) & 0xFFu;
+        int slot = atomicAdd(&bucket_cursor[bucket], 1);
+        int dst = prefix[bucket] + slot;
+        out_pairs[dst * 2 + 0] = p0;
+        out_pairs[dst * 2 + 1] = p1;
+        out_shifts[dst] = ps;
+    }
+}
+
 __global__ void pack_verlet_candidates(
     const size_t* __restrict__ candidate_pairs,
     const int* __restrict__ candidate_shifts,

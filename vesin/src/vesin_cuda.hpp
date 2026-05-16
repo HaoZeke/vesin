@@ -78,6 +78,12 @@ struct CudaNeighborListExtras {
     uint32_t* verlet_compact_candidate_pairs = nullptr;  // [candidate_length * 2]
     int32_t* verlet_compact_candidate_shifts = nullptr;  // [candidate_length] packed signed 10-bit shifts
     int32_t* verlet_compact_overflow_flag = nullptr;     // [1]
+    // Ping-pong buffers + histogram/cursor for the in-place radix sort
+    // of the compact candidate cache. Allocated lazily by the sort path.
+    uint32_t* verlet_radix_pairs_alt = nullptr;          // [candidate_length * 2]
+    int32_t* verlet_radix_shifts_alt = nullptr;          // [candidate_length]
+    int32_t* verlet_radix_histogram = nullptr;           // [256]
+    int32_t* verlet_radix_cursor = nullptr;              // [256]
     size_t verlet_candidate_length = 0;
     size_t verlet_compact_candidate_capacity = 0;
     bool verlet_has_compact_candidates = false;

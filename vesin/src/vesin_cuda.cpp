@@ -304,10 +304,18 @@ static void free_verlet_compact_buffers(CudaNeighborListExtras& extras) {
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_candidate_pairs));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_candidate_shifts));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_overflow_flag));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_pairs_alt));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_shifts_alt));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_histogram));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_cursor));
 
     extras.verlet_compact_candidate_pairs = nullptr;
     extras.verlet_compact_candidate_shifts = nullptr;
     extras.verlet_compact_overflow_flag = nullptr;
+    extras.verlet_radix_pairs_alt = nullptr;
+    extras.verlet_radix_shifts_alt = nullptr;
+    extras.verlet_radix_histogram = nullptr;
+    extras.verlet_radix_cursor = nullptr;
     extras.verlet_candidate_length = 0;
     extras.verlet_compact_candidate_capacity = 0;
     extras.verlet_has_compact_candidates = false;
@@ -802,69 +810,134 @@ static void compact_verlet_candidate_cache(
     // the default keeps it on.
 #ifndef VESIN_DISABLE_COMPACT_SORT
     if (candidate_length > 1) {
-        size_t sort_capacity = next_power_of_two(candidate_length);
-        // ensure_verlet_compact_buffers already over-allocates to
-        // next_power_of_two, so the pad+sort can write past
-        // candidate_length safely.
+        // 4-pass 8-bit radix sort. Replaces the previous bitonic sort
+        // chain (~1880 launches / rebuild at N=8192) with 12 launches
+        // (3 per pass x 4 passes). Sort is NOT stable; the downstream
+        // filter only requires i-grouping for ri reuse, not a specific
+        // order among pairs sharing an i.
+        //
+        // Lazily allocate the ping-pong + histogram + cursor buffers
+        // sized to candidate_length (no power-of-two padding needed).
+        if (extras.verlet_radix_pairs_alt == nullptr ||
+            extras.verlet_compact_candidate_capacity < candidate_length) {
+            // verlet_compact_candidate_capacity grew already to >= candidate_length
+            // (with next_pow2 padding) above; reuse that capacity for the
+            // alt buffer so we never under-allocate.
+            size_t alt_cap = extras.verlet_compact_candidate_capacity;
+            if (extras.verlet_radix_pairs_alt != nullptr) {
+                GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_pairs_alt));
+                extras.verlet_radix_pairs_alt = nullptr;
+            }
+            if (extras.verlet_radix_shifts_alt != nullptr) {
+                GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_shifts_alt));
+                extras.verlet_radix_shifts_alt = nullptr;
+            }
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_pairs_alt,
+                                           sizeof(uint32_t) * alt_cap * 2));
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_shifts_alt,
+                                           sizeof(int32_t) * alt_cap));
+        }
+        if (extras.verlet_radix_histogram == nullptr) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_histogram,
+                                           sizeof(int32_t) * 256));
+        }
+        if (extras.verlet_radix_cursor == nullptr) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_cursor,
+                                           sizeof(int32_t) * 256));
+        }
 
-        auto* pad_kernel = factory.create(
-            "pad_compact_candidates",
+        auto* hist_kernel = factory.create(
+            "radix_histogram",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        auto* prefix_kernel = factory.create(
+            "radix_prefix_sum_256",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        auto* scatter_kernel = factory.create(
+            "radix_scatter",
             cuda_verlet_code,
             "cuda_verlet.cu",
             {"-std=c++17", "-default-device"}
         );
 
-        auto* sort_kernel = factory.create(
-            "sort_compact_candidates_bitonic_step",
-            cuda_verlet_code,
-            "cuda_verlet.cu",
-            {"-std=c++17", "-default-device"}
-        );
-
-        const size_t sort_threads = 256;
-        const size_t sort_blocks = std::max(
-            (sort_capacity + sort_threads - 1) / sort_threads,
+        const size_t threads = 256;
+        const size_t blocks = std::max(
+            (candidate_length + threads - 1) / threads,
             static_cast<size_t>(1)
         );
 
-        std::vector<void*> pad_args = {
-            static_cast<void*>(&d_compact_pairs),
-            static_cast<void*>(&d_compact_shifts),
-            static_cast<void*>(&candidate_length),
-            static_cast<void*>(&sort_capacity),
-        };
-        pad_kernel->launch(
-            dim3(sort_blocks),
-            dim3(sort_threads),
-            0,
-            nullptr,
-            pad_args,
-            false
-        );
+        uint32_t* src_pairs = d_compact_pairs;
+        int32_t* src_shifts = d_compact_shifts;
+        uint32_t* dst_pairs = extras.verlet_radix_pairs_alt;
+        int32_t* dst_shifts = extras.verlet_radix_shifts_alt;
+        int32_t* d_histogram = extras.verlet_radix_histogram;
+        int32_t* d_cursor = extras.verlet_radix_cursor;
 
-        for (size_t k = 2; k <= sort_capacity; k <<= 1) {
-            for (size_t j = k >> 1; j > 0; j >>= 1) {
-                std::vector<void*> step_args = {
-                    static_cast<void*>(&d_compact_pairs),
-                    static_cast<void*>(&d_compact_shifts),
-                    static_cast<void*>(&sort_capacity),
-                    static_cast<void*>(&j),
-                    static_cast<void*>(&k),
-                };
-                sort_kernel->launch(
-                    dim3(sort_blocks),
-                    dim3(sort_threads),
-                    0,
-                    nullptr,
-                    step_args,
-                    false
-                );
-            }
+        for (unsigned int pass = 0; pass < 4; ++pass) {
+            unsigned int shift_bits = pass * 8u;
+
+            GPULITE_CUDART_CALL(cudaMemset(d_histogram, 0, sizeof(int32_t) * 256));
+            GPULITE_CUDART_CALL(cudaMemset(d_cursor, 0, sizeof(int32_t) * 256));
+
+            std::vector<void*> hist_args = {
+                static_cast<void*>(&src_pairs),
+                static_cast<void*>(&candidate_length),
+                static_cast<void*>(&shift_bits),
+                static_cast<void*>(&d_histogram),
+            };
+            hist_kernel->launch(
+                dim3(blocks), dim3(threads), 0, nullptr, hist_args, false
+            );
+
+            std::vector<void*> prefix_args = {
+                static_cast<void*>(&d_histogram),
+            };
+            prefix_kernel->launch(
+                dim3(1), dim3(256), 0, nullptr, prefix_args, false
+            );
+
+            std::vector<void*> scatter_args = {
+                static_cast<void*>(&src_pairs),
+                static_cast<void*>(&src_shifts),
+                static_cast<void*>(&dst_pairs),
+                static_cast<void*>(&dst_shifts),
+                static_cast<void*>(&candidate_length),
+                static_cast<void*>(&shift_bits),
+                static_cast<void*>(&d_histogram),
+                static_cast<void*>(&d_cursor),
+            };
+            scatter_kernel->launch(
+                dim3(blocks), dim3(threads), 0, nullptr, scatter_args, false
+            );
+
+            // Ping-pong: next pass reads from the just-written dst.
+            std::swap(src_pairs, dst_pairs);
+            std::swap(src_shifts, dst_shifts);
         }
-        // After sort, the first `candidate_length` entries are the actual
-        // candidates (sorted); the remaining entries up to sort_capacity
-        // hold the UINT_MAX sentinels and are ignored by the filter kernel
-        // (which uses candidate_length as its loop bound).
+
+        // After 4 passes the final sorted result is in src_pairs / src_shifts
+        // (the buffers were swapped after each pass, so what was the source
+        // of the LAST pass now holds the output of the LAST pass after the
+        // swap). If that is not the original d_compact_pairs, copy the
+        // sorted data back so the filter kernel reads from the expected
+        // location.
+        if (src_pairs != d_compact_pairs) {
+            GPULITE_CUDART_CALL(cudaMemcpyAsync(
+                d_compact_pairs, src_pairs,
+                sizeof(uint32_t) * candidate_length * 2,
+                cudaMemcpyDeviceToDevice
+            ));
+            GPULITE_CUDART_CALL(cudaMemcpyAsync(
+                d_compact_shifts, src_shifts,
+                sizeof(int32_t) * candidate_length,
+                cudaMemcpyDeviceToDevice
+            ));
+        }
     }
 #endif // VESIN_DISABLE_COMPACT_SORT
 
