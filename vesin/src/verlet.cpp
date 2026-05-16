@@ -227,24 +227,32 @@ static void filter_simd_candidate_blocks(
 
         simd_filter_deltas(dx, dy, dz, cutoff_sq, dist_sq, mask);
 
+        // Pre-grow once per block. Worst case is every lane in this block
+        // passes the filter, so reserve growable.length() + block.count up
+        // front. This hoists the per-pair capacity branch out of the hot
+        // lane loop below (cachegrind: 34% of total instructions were in
+        // the per-pair set_*'s capacity check + grow); the unchecked
+        // set_*_unchecked variants below skip it entirely.
+        growable.ensure_capacity(growable.length() + block.count);
+
         for (size_t lane = 0; lane < block.count; lane++) {
             if (!mask[lane]) {
                 continue;
             }
 
             auto index = growable.length();
-            growable.set_pair(index, block.first[lane], block.second[lane]);
+            growable.set_pair_unchecked(index, block.first[lane], block.second[lane]);
 
             if (options.return_shifts) {
-                growable.set_shift(index, block.shifts[lane]);
+                growable.set_shift_unchecked(index, block.shifts[lane]);
             }
 
             if (options.return_distances) {
-                growable.set_distance(index, std::sqrt(dist_sq[lane]));
+                growable.set_distance_unchecked(index, std::sqrt(dist_sq[lane]));
             }
 
             if (options.return_vectors) {
-                growable.set_vector(index, Vector{dx[lane], dy[lane], dz[lane]});
+                growable.set_vector_unchecked(index, Vector{dx[lane], dy[lane], dz[lane]});
             }
 
             growable.increment_length();
@@ -420,6 +428,11 @@ void cpu::VerletState::recompute(
     auto growable = cpu::GrowableNeighborList{neighbors, initial_capacity, options};
     growable.reset();
 
+    // Pre-grow once for the worst case (every candidate passes the filter)
+    // so the inner loop never branches on capacity. Mirror change to the
+    // SIMD-block path above.
+    growable.ensure_capacity(this->candidates.length);
+
     // The cached list is an over-complete Verlet candidate list. Each call
     // filters candidates with the exact cutoff and requested shift/vector outputs.
     for (size_t k = 0; k < this->candidates.length; k++) {
@@ -437,18 +450,18 @@ void cpu::VerletState::recompute(
 
         if (dist_sq < cutoff_sq) {
             auto idx = growable.length();
-            growable.set_pair(idx, i, j);
+            growable.set_pair_unchecked(idx, i, j);
 
             if (options.return_shifts) {
-                growable.set_shift(idx, shift);
+                growable.set_shift_unchecked(idx, shift);
             }
 
             if (options.return_distances) {
-                growable.set_distance(idx, std::sqrt(dist_sq));
+                growable.set_distance_unchecked(idx, std::sqrt(dist_sq));
             }
 
             if (options.return_vectors) {
-                growable.set_vector(idx, vec);
+                growable.set_vector_unchecked(idx, vec);
             }
 
             growable.increment_length();
