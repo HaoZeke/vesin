@@ -62,13 +62,61 @@ static constexpr int VESIN_RADIX_BITS = 8;
 static constexpr int VESIN_RADIX_BUCKETS = 1 << VESIN_RADIX_BITS;
 static constexpr int VESIN_RADIX_PASSES = 32 / VESIN_RADIX_BITS;
 
-// Default kernel block size used by the bitonic-sort + radix-sort
-// launches in compact_verlet_candidate_cache. A device-aware version
-// would query gpulite for warp size and pick warp_size * 8; the value
-// below assumes a 32-thread warp and 8 warps/block, which is the
-// configuration every CC >= 6.0 GPU supports. perf-decisions.org has
-// the deferred plan for the device-query refactor.
-static constexpr size_t VESIN_DEFAULT_BLOCK_SIZE = 256;
+// "Generic sweet-spot warps per block" -- 8 warps balances per-block
+// scheduling overhead with leaving headroom for multiple resident
+// blocks per SM. This is an algorithmic / scheduling choice, not a
+// device property; the actual block size comes out of
+// default_block_size() which multiplies it by the device warp size.
+static constexpr int VESIN_DEFAULT_WARPS_PER_BLOCK = 8;
+
+// Cached device properties queried once via gpulite cuDeviceGetAttribute.
+// The CUDA driver-API enum values used here (1 = MAX_THREADS_PER_BLOCK,
+// 16 = MULTIPROCESSOR_COUNT, 39 = MAX_THREADS_PER_MULTIPROCESSOR,
+// 82 = MAX_REGISTERS_PER_MULTIPROCESSOR) are wider than gpulite's
+// abbreviated CUdevice_attribute_enum; cast to CUdevice_attribute is
+// safe because cuDeviceGetAttribute takes the underlying integer.
+struct VesinGpuProperties {
+    int warp_size;
+    int max_threads_per_block;
+    int max_threads_per_multiprocessor;
+    int multiprocessor_count;
+    int max_registers_per_multiprocessor;
+};
+
+static const VesinGpuProperties& gpu_properties() {
+    static const VesinGpuProperties props = []() {
+        VesinGpuProperties p{};
+        auto& driver = gpulite::CUDADriver::instance();
+        CUdevice dev = 0;
+        GPULITE_CUDA_DRIVER_CALL(driver.cuCtxGetDevice(&dev));
+        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+            &p.warp_size, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev));
+        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+            &p.max_threads_per_block,
+            static_cast<CUdevice_attribute>(1), dev));
+        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+            &p.multiprocessor_count,
+            static_cast<CUdevice_attribute>(16), dev));
+        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+            &p.max_threads_per_multiprocessor,
+            static_cast<CUdevice_attribute>(39), dev));
+        GPULITE_CUDA_DRIVER_CALL(driver.cuDeviceGetAttribute(
+            &p.max_registers_per_multiprocessor,
+            static_cast<CUdevice_attribute>(82), dev));
+        return p;
+    }();
+    return props;
+}
+
+// Device-derived block size for the sort + zero kernels in
+// compact_verlet_candidate_cache. Caps at max_threads_per_block so we
+// never violate the hardware bound on tiny devices.
+static inline size_t default_block_size() {
+    const auto& p = gpu_properties();
+    size_t target = static_cast<size_t>(p.warp_size) *
+                    static_cast<size_t>(VESIN_DEFAULT_WARPS_PER_BLOCK);
+    return std::min(target, static_cast<size_t>(p.max_threads_per_block));
+}
 
 // Helper functions for CPU-side vector math
 static inline double cpu_dot3(const double* a, const double* b) {
@@ -898,7 +946,7 @@ static void compact_verlet_candidate_cache(
             {"-std=c++17", "-default-device"}
         );
 
-        const size_t threads = VESIN_DEFAULT_BLOCK_SIZE;
+        const size_t threads = default_block_size();
         const size_t blocks = std::max(
             (candidate_length + threads - 1) / threads,
             static_cast<size_t>(1)
@@ -1002,7 +1050,7 @@ static void compact_verlet_candidate_cache(
             {"-std=c++17", "-default-device"}
         );
 
-        const size_t sort_threads = VESIN_DEFAULT_BLOCK_SIZE;
+        const size_t sort_threads = default_block_size();
         const size_t sort_blocks = std::max(
             (sort_capacity + sort_threads - 1) / sort_threads,
             static_cast<size_t>(1)
