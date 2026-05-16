@@ -153,6 +153,9 @@ __global__ void filter_verlet_compact_candidates_block(
 ) {
     const double cutoff2 = cutoff * cutoff;
 
+    size_t prev_i = SIZE_MAX;
+    const double* ri = nullptr;
+
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < candidate_length;
          idx += blockDim.x * gridDim.x) {
@@ -165,7 +168,10 @@ __global__ void filter_verlet_compact_candidates_block(
         int sy = unpack_verlet_shift(packed_shift, 10);
         int sz = unpack_verlet_shift(packed_shift, 20);
 
-        const double* ri = &positions[i * 3];
+        if (i != prev_i) {
+            ri = &positions[i * 3];
+            prev_i = i;
+        }
         const double* rj = &positions[j * 3];
 
         double vx = rj[0] - ri[0];
