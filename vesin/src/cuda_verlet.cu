@@ -156,6 +156,14 @@ __global__ void filter_verlet_compact_candidates_block(
     size_t prev_i = static_cast<size_t>(-1);
     const double* ri = nullptr;
 
+    // __shared__ declarations must live at kernel (function) scope, not
+    // inside the grid-stride for loop below: CUDA rejects them in control
+    // flow blocks. Without this, NVRTC fails with "expected a ';'" at the
+    // start of the next function in the translation unit.
+    extern __shared__ unsigned int warp_offsets[];
+    __shared__ size_t block_base;
+    const int warp_count_slots = (blockDim.x + 31) / 32;
+
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < candidate_length;
          idx += blockDim.x * gridDim.x) {
@@ -185,61 +193,59 @@ __global__ void filter_verlet_compact_candidates_block(
         double dist_sq = vx * vx + vy * vy + vz * vz;
 
         bool keep = dist_sq < cutoff2;
-    unsigned active_mask = __activemask();
-    unsigned passing_mask = __ballot_sync(active_mask, keep);
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int lane_rank = __popc(passing_mask & ((1u << lane) - 1u));
-    unsigned warp_count = __popc(passing_mask);
+        unsigned active_mask = __activemask();
+        unsigned passing_mask = __ballot_sync(active_mask, keep);
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        int lane_rank = __popc(passing_mask & ((1u << lane) - 1u));
+        unsigned warp_count = __popc(passing_mask);
 
-    extern __shared__ unsigned int warp_offsets[];
-    int warp_count_slots = (blockDim.x + 31) / 32;
-    if (lane == 0) {
-        warp_offsets[warp] = warp_count;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        unsigned running = 0;
-        for (int slot = 0; slot < warp_count_slots; slot++) {
-            unsigned count = warp_offsets[slot];
-            warp_offsets[slot] = running;
-            running += count;
+        if (lane == 0) {
+            warp_offsets[warp] = warp_count;
         }
-        warp_offsets[warp_count_slots] = running;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    __shared__ size_t block_base;
-    if (threadIdx.x == 0) {
-        block_base = warp_offsets[warp_count_slots] == 0 ? 0 : atomicAdd_size_t(length, warp_offsets[warp_count_slots]);
-    }
-    __syncthreads();
-
-    if (keep) {
-        size_t out = block_base + static_cast<size_t>(warp_offsets[warp] + lane_rank);
-        if (out >= max_pairs) {
-            atomicExch(overflow_flag, 1);
-            return;
+        if (threadIdx.x == 0) {
+            unsigned running = 0;
+            for (int slot = 0; slot < warp_count_slots; slot++) {
+                unsigned count = warp_offsets[slot];
+                warp_offsets[slot] = running;
+                running += count;
+            }
+            warp_offsets[warp_count_slots] = running;
         }
+        __syncthreads();
 
-        pair_indices[out * 2 + 0] = i;
-        pair_indices[out * 2 + 1] = j;
-
-        if (return_shifts) {
-            shifts_out[out * 3 + 0] = sx;
-            shifts_out[out * 3 + 1] = sy;
-            shifts_out[out * 3 + 2] = sz;
+        if (threadIdx.x == 0) {
+            block_base = warp_offsets[warp_count_slots] == 0 ? 0 : atomicAdd_size_t(length, warp_offsets[warp_count_slots]);
         }
+        __syncthreads();
 
-        if (return_distances) {
-            distances[out] = sqrt(dist_sq);
-        }
+        if (keep) {
+            size_t out = block_base + static_cast<size_t>(warp_offsets[warp] + lane_rank);
+            if (out >= max_pairs) {
+                atomicExch(overflow_flag, 1);
+                return;
+            }
 
-        if (return_vectors) {
-            vectors[out * 3 + 0] = vx;
-            vectors[out * 3 + 1] = vy;
-            vectors[out * 3 + 2] = vz;
+            pair_indices[out * 2 + 0] = i;
+            pair_indices[out * 2 + 1] = j;
+
+            if (return_shifts) {
+                shifts_out[out * 3 + 0] = sx;
+                shifts_out[out * 3 + 1] = sy;
+                shifts_out[out * 3 + 2] = sz;
+            }
+
+            if (return_distances) {
+                distances[out] = sqrt(dist_sq);
+            }
+
+            if (return_vectors) {
+                vectors[out * 3 + 0] = vx;
+                vectors[out * 3 + 1] = vy;
+                vectors[out * 3 + 2] = vz;
+            }
         }
     }
 }
