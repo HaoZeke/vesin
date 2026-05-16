@@ -73,6 +73,28 @@ __global__ void sort_compact_candidates_bitonic_step(
     }
 }
 
+// Quick "is the input already sorted by first-key?" check kernel that
+// runs in parallel and atomically clears a host-visible flag if any
+// adjacent pair is out of order. The cell-list pack step usually
+// produces a candidate list that is almost-monotonic in i, so the
+// expensive bitonic sort can be skipped most of the time. Profiling at
+// N=8192 showed the bitonic chain dominated rebuild wall-clock; this
+// avoids it whenever the input ordering is already good enough for the
+// downstream filter kernel.
+__global__ void check_compact_candidates_sorted(
+    const unsigned int* __restrict__ pairs,
+    size_t length,
+    int* __restrict__ unsorted_flag
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx + 1 >= length) {
+        return;
+    }
+    if (pairs[idx * 2 + 0] > pairs[(idx + 1) * 2 + 0]) {
+        atomicExch(unsorted_flag, 1);
+    }
+}
+
 // Pad the compact candidate cache from `length` up to `capacity` with a
 // sentinel that sorts to the end of the bitonic sequence (pair[0] = UINT_MAX).
 // The shift value of the padding entries is irrelevant because the host
