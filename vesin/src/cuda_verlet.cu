@@ -153,7 +153,7 @@ __global__ void filter_verlet_compact_candidates_block(
 ) {
     const double cutoff2 = cutoff * cutoff;
 
-    size_t prev_i = SIZE_MAX;
+    size_t prev_i = static_cast<size_t>(-1);
     const double* ri = nullptr;
 
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -269,7 +269,7 @@ __global__ void filter_verlet_candidates(
 
     double cutoff2 = cutoff * cutoff;
     size_t i = 0;
-    size_t prev_i = SIZE_MAX;
+    size_t prev_i = static_cast<size_t>(-1);
     size_t j = 0;
     int sx = 0;
     int sy = 0;
