@@ -927,12 +927,12 @@ static void compact_verlet_candidate_cache(
         // sorted data back so the filter kernel reads from the expected
         // location.
         if (src_pairs != d_compact_pairs) {
-            GPULITE_CUDART_CALL(cudaMemcpyAsync(
+            GPULITE_CUDART_CALL(cudaMemcpy(
                 d_compact_pairs, src_pairs,
                 sizeof(uint32_t) * candidate_length * 2,
                 cudaMemcpyDeviceToDevice
             ));
-            GPULITE_CUDART_CALL(cudaMemcpyAsync(
+            GPULITE_CUDART_CALL(cudaMemcpy(
                 d_compact_shifts, src_shifts,
                 sizeof(int32_t) * candidate_length,
                 cudaMemcpyDeviceToDevice
