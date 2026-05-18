@@ -5,6 +5,7 @@
 #include <iostream>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -51,6 +52,7 @@ static constexpr size_t DEFAULT_MAX_CELLS = 8192;
 // Lower values create more cells and reduce per-cell neighbor work, which is
 // beneficial on larger systems where more coarse grids become too dense.
 static constexpr size_t MIN_PARTICLES_PER_CELL = 8;
+static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 16384;
 
 static std::optional<cudaPointerAttributes> get_ptr_attributes(const void* ptr) {
     if (ptr == nullptr) {
@@ -165,12 +167,26 @@ static void ensure_sort_buffers(
     }
 }
 
+static void free_verlet_compact_buffers(CudaNeighborListExtras& extras) {
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_candidate_pairs));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_candidate_shifts));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_overflow_flag));
+
+    extras.verlet_compact_candidate_pairs = nullptr;
+    extras.verlet_compact_candidate_shifts = nullptr;
+    extras.verlet_compact_overflow_flag = nullptr;
+    extras.verlet_candidate_length = 0;
+    extras.verlet_compact_candidate_capacity = 0;
+    extras.verlet_has_compact_candidates = false;
+}
+
 static void free_verlet_buffers(CudaNeighborListExtras& extras) {
     if (extras.verlet_candidates.device.type == VesinCUDA) {
         free_neighbors(extras.verlet_candidates);
     }
 
     extras.verlet_candidates = VesinNeighborList();
+    free_verlet_compact_buffers(extras);
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_ref_positions));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_rebuild_flag));
 
@@ -558,6 +574,91 @@ static void ensure_verlet_ref_buffers(CudaNeighborListExtras& extras, size_t n_p
     }
 }
 
+static void ensure_verlet_compact_buffers(CudaNeighborListExtras& extras, size_t candidate_length) {
+    auto capacity = std::max(candidate_length, static_cast<size_t>(1));
+    if (extras.verlet_compact_candidate_capacity < capacity) {
+        free_verlet_compact_buffers(extras);
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_pairs, sizeof(uint32_t) * capacity * 2));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_shifts, sizeof(int32_t) * capacity));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_overflow_flag, sizeof(int32_t)));
+        extras.verlet_compact_candidate_capacity = capacity;
+    }
+
+    if (extras.verlet_compact_overflow_flag == nullptr) {
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_overflow_flag, sizeof(int32_t)));
+    }
+}
+
+static void compact_verlet_candidate_cache(
+    CudaNeighborListExtras& extras,
+    gpulite::KernelFactory& factory,
+    const std::string& cuda_verlet_code,
+    size_t n_points
+) {
+    auto candidate_length = extras.verlet_candidates.length;
+    extras.verlet_candidate_length = candidate_length;
+    extras.verlet_has_compact_candidates = false;
+
+    if (candidate_length == 0 || n_points < CUDA_VERLET_COMPACT_MIN_POINTS ||
+        n_points > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        return;
+    }
+
+    ensure_verlet_compact_buffers(extras, candidate_length);
+    extras.verlet_candidate_length = candidate_length;
+    GPULITE_CUDART_CALL(cudaMemset(extras.verlet_compact_overflow_flag, 0, sizeof(int32_t)));
+
+    auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
+    auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
+    auto* d_compact_pairs = extras.verlet_compact_candidate_pairs;
+    auto* d_compact_shifts = extras.verlet_compact_candidate_shifts;
+    auto* d_overflow_flag = extras.verlet_compact_overflow_flag;
+
+    auto* kernel = factory.create(
+        "pack_verlet_candidates",
+        cuda_verlet_code,
+        "cuda_verlet.cu",
+        {"-std=c++17", "-default-device"}
+    );
+
+    size_t threads = 256;
+    size_t blocks = (candidate_length + threads - 1) / threads;
+    std::vector<void*> args = {
+        static_cast<void*>(&d_candidate_pairs),
+        static_cast<void*>(&d_candidate_shifts),
+        static_cast<void*>(&candidate_length),
+        static_cast<void*>(&d_compact_pairs),
+        static_cast<void*>(&d_compact_shifts),
+        static_cast<void*>(&d_overflow_flag),
+    };
+    kernel->launch(
+        dim3(std::max(blocks, static_cast<size_t>(1))),
+        dim3(threads),
+        0,
+        nullptr,
+        args,
+        false
+    );
+
+    int32_t h_overflow = 0;
+    GPULITE_CUDART_CALL(cudaMemcpy(
+        &h_overflow,
+        d_overflow_flag,
+        sizeof(int32_t),
+        cudaMemcpyDeviceToHost
+    ));
+
+    if (h_overflow != 0) {
+        return;
+    }
+
+    extras.verlet_has_compact_candidates = true;
+    if (extras.verlet_candidates.device.type == VesinCUDA) {
+        free_neighbors(extras.verlet_candidates);
+        extras.verlet_candidates = VesinNeighborList();
+    }
+}
+
 static bool verlet_needs_rebuild(
     CudaNeighborListExtras& extras,
     gpulite::KernelFactory& factory,
@@ -615,6 +716,8 @@ static bool verlet_needs_rebuild(
 
 static void rebuild_verlet_cache(
     CudaNeighborListExtras& extras,
+    gpulite::KernelFactory& factory,
+    const std::string& cuda_verlet_code,
     const double (*points)[3],
     size_t n_points,
     const double box[3][3],
@@ -649,6 +752,7 @@ static void rebuild_verlet_cache(
         build_options,
         extras.verlet_candidates
     );
+    compact_verlet_candidate_cache(extras, factory, cuda_verlet_code, n_points);
 
     ensure_verlet_ref_buffers(extras, n_points);
     GPULITE_CUDART_CALL(cudaMemcpy(
@@ -723,7 +827,7 @@ static void recompute_verlet_neighbors(
     VesinOptions options,
     VesinNeighborList& neighbors
 ) {
-    size_t candidate_length = extras.verlet_candidates.length;
+    size_t candidate_length = extras.verlet_candidate_length;
     ensure_verlet_output_buffers(neighbors, extras, extras.verlet_n_points, candidate_length, options);
 
     auto* d_pair_indices = reinterpret_cast<size_t*>(neighbors.pairs);
@@ -734,45 +838,86 @@ static void recompute_verlet_neighbors(
     auto* d_overflow_flag = extras.overflow_flag;
     size_t max_pairs = extras.max_pairs;
 
-    auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
-    auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
-
-    auto* kernel = factory.create(
-        "filter_verlet_candidates",
-        cuda_verlet_code,
-        "cuda_verlet.cu",
-        {"-std=c++17", "-default-device"}
-    );
-
     size_t threads = 256;
     size_t blocks = (candidate_length + threads - 1) / threads;
-    std::vector<void*> args = {
-        static_cast<void*>(&d_positions),
-        static_cast<void*>(&d_box),
-        static_cast<void*>(&d_candidate_pairs),
-        static_cast<void*>(&d_candidate_shifts),
-        static_cast<void*>(&candidate_length),
-        static_cast<void*>(&options.cutoff),
-        static_cast<void*>(&d_pair_counter),
-        static_cast<void*>(&d_pair_indices),
-        static_cast<void*>(&d_shifts),
-        static_cast<void*>(&d_distances),
-        static_cast<void*>(&d_vectors),
-        static_cast<void*>(&options.return_shifts),
-        static_cast<void*>(&options.return_distances),
-        static_cast<void*>(&options.return_vectors),
-        static_cast<void*>(&max_pairs),
-        static_cast<void*>(&d_overflow_flag),
-    };
+    if (extras.verlet_has_compact_candidates) {
+        auto* d_candidate_pairs = extras.verlet_compact_candidate_pairs;
+        auto* d_candidate_shifts = extras.verlet_compact_candidate_shifts;
 
-    kernel->launch(
-        dim3(std::max(blocks, static_cast<size_t>(1))),
-        dim3(threads),
-        0,
-        nullptr,
-        args,
-        false
-    );
+        auto* kernel = factory.create(
+            "filter_verlet_compact_candidates_block",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        size_t shared_mem = sizeof(uint32_t) * ((threads + 31) / 32 + 1);
+
+        std::vector<void*> args = {
+            static_cast<void*>(&d_positions),
+            static_cast<void*>(&d_box),
+            static_cast<void*>(&d_candidate_pairs),
+            static_cast<void*>(&d_candidate_shifts),
+            static_cast<void*>(&candidate_length),
+            static_cast<void*>(&options.cutoff),
+            static_cast<void*>(&d_pair_counter),
+            static_cast<void*>(&d_pair_indices),
+            static_cast<void*>(&d_shifts),
+            static_cast<void*>(&d_distances),
+            static_cast<void*>(&d_vectors),
+            static_cast<void*>(&options.return_shifts),
+            static_cast<void*>(&options.return_distances),
+            static_cast<void*>(&options.return_vectors),
+            static_cast<void*>(&max_pairs),
+            static_cast<void*>(&d_overflow_flag),
+        };
+
+        kernel->launch(
+            dim3(std::max(blocks, static_cast<size_t>(1))),
+            dim3(threads),
+            shared_mem,
+            nullptr,
+            args,
+            false
+        );
+    } else {
+        auto* d_candidate_pairs = reinterpret_cast<size_t*>(extras.verlet_candidates.pairs);
+        auto* d_candidate_shifts = reinterpret_cast<int32_t*>(extras.verlet_candidates.shifts);
+
+        auto* kernel = factory.create(
+            "filter_verlet_candidates",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        std::vector<void*> args = {
+            static_cast<void*>(&d_positions),
+            static_cast<void*>(&d_box),
+            static_cast<void*>(&d_candidate_pairs),
+            static_cast<void*>(&d_candidate_shifts),
+            static_cast<void*>(&candidate_length),
+            static_cast<void*>(&options.cutoff),
+            static_cast<void*>(&d_pair_counter),
+            static_cast<void*>(&d_pair_indices),
+            static_cast<void*>(&d_shifts),
+            static_cast<void*>(&d_distances),
+            static_cast<void*>(&d_vectors),
+            static_cast<void*>(&options.return_shifts),
+            static_cast<void*>(&options.return_distances),
+            static_cast<void*>(&options.return_vectors),
+            static_cast<void*>(&max_pairs),
+            static_cast<void*>(&d_overflow_flag),
+        };
+
+        kernel->launch(
+            dim3(std::max(blocks, static_cast<size_t>(1))),
+            dim3(threads),
+            0,
+            nullptr,
+            args,
+            false
+        );
+    }
 
     GPULITE_CUDART_CALL(cudaMemcpyAsync(
         extras.pinned_length_ptr,
@@ -894,6 +1039,8 @@ void vesin::cuda::neighbors(
             )) {
             rebuild_verlet_cache(
                 *extras,
+                factory,
+                cuda_verlet_code,
                 points,
                 n_points,
                 box,
