@@ -191,7 +191,7 @@ TEST_CASE("Test CUDA Verlet skin cache") {
 
     auto options = VesinOptions();
     options.cutoff = 2.5;
-    options.skin = 0.8;  // enable Verlet cache path
+    options.skin = 0.8; // enable Verlet cache path
     options.full = true;
     options.sorted = false;
     options.algorithm = VesinAutoAlgorithm;
@@ -200,9 +200,7 @@ TEST_CASE("Test CUDA Verlet skin cache") {
 
     const char* error_message = nullptr;
     auto status = vesin_neighbors(
-        d_points, n_points, d_box, d_periodic,
-        {VesinDeviceKind::VesinCUDA, device_id},
-        options, &neighbors, &error_message
+        d_points, n_points, d_box, d_periodic, {VesinDeviceKind::VesinCUDA, device_id}, options, &neighbors, &error_message
     );
     REQUIRE(error_message == nullptr);
     REQUIRE(status == EXIT_SUCCESS);
@@ -217,18 +215,24 @@ TEST_CASE("Test CUDA Verlet skin cache") {
     check_cuda(cudaMemcpy(d_points, moved_points, sizeof(double) * n_points * 3, cudaMemcpyHostToDevice));
 
     status = vesin_neighbors(
-        d_points, n_points, d_box, d_periodic,
-        {VesinDeviceKind::VesinCUDA, device_id},
-        options, &neighbors, &error_message
+        d_points, n_points, d_box, d_periodic, {VesinDeviceKind::VesinCUDA, device_id}, options, &neighbors, &error_message
     );
     REQUIRE(error_message == nullptr);
     REQUIRE(status == EXIT_SUCCESS);
 
     // cleanup
-    if (neighbors.pairs) cudaFree(neighbors.pairs);
-    if (neighbors.shifts) cudaFree(neighbors.shifts);
-    if (neighbors.distances) cudaFree(neighbors.distances);
-    if (neighbors.vectors) cudaFree(neighbors.vectors);
+    if (neighbors.pairs) {
+        cudaFree(neighbors.pairs);
+    }
+    if (neighbors.shifts) {
+        cudaFree(neighbors.shifts);
+    }
+    if (neighbors.distances) {
+        cudaFree(neighbors.distances);
+    }
+    if (neighbors.vectors) {
+        cudaFree(neighbors.vectors);
+    }
     cudaFree(d_points);
     cudaFree(d_box);
     cudaFree(d_periodic);

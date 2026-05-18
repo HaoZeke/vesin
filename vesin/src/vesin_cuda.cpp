@@ -53,7 +53,7 @@ static constexpr size_t DEFAULT_MAX_CELLS = 8192;
 // Lower values create more cells and reduce per-cell neighbor work, which is
 // beneficial on larger systems where more coarse grids become too dense.
 static constexpr size_t MIN_PARTICLES_PER_CELL = 8;
-static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 1024;  // lowered so the efficient block-compact + sorted path is used even in medium-size profiling runs (real hotspot data)
+static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 1024; // lowered so the efficient block-compact + sorted path is used even in medium-size profiling runs (real hotspot data)
 
 // Radix-sort algorithm constants. NOT device properties -- these come
 // from the choice to use an 8-bit radix on uint32 candidate keys.
@@ -89,19 +89,28 @@ static const VesinGpuProperties& gpu_properties() {
         CUdevice dev = 0;
         GPULITE_CUDA_DRIVER_CALL(cuCtxGetDevice(&dev));
         GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
-            &p.warp_size, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev));
+            &p.warp_size, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev
+        ));
         GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.max_threads_per_block,
-            static_cast<CUdevice_attribute>(1), dev));
+            static_cast<CUdevice_attribute>(1),
+            dev
+        ));
         GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.multiprocessor_count,
-            static_cast<CUdevice_attribute>(16), dev));
+            static_cast<CUdevice_attribute>(16),
+            dev
+        ));
         GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.max_threads_per_multiprocessor,
-            static_cast<CUdevice_attribute>(39), dev));
+            static_cast<CUdevice_attribute>(39),
+            dev
+        ));
         GPULITE_CUDA_DRIVER_CALL(cuDeviceGetAttribute(
             &p.max_registers_per_multiprocessor,
-            static_cast<CUdevice_attribute>(82), dev));
+            static_cast<CUdevice_attribute>(82),
+            dev
+        ));
         return p;
     }();
     return props;
@@ -254,7 +263,7 @@ static void free_verlet_compact_buffers(CudaNeighborListExtras& extras) {
 
 static void free_verlet_buffers(CudaNeighborListExtras& extras) {
     if (extras.verlet_candidates.device.type == VesinCUDA) {
-        free_neighbors(extras.verlet_candidates);
+        vesin::cuda::free_neighbors(extras.verlet_candidates);
     }
 
     extras.verlet_candidates = VesinNeighborList();
@@ -773,19 +782,15 @@ static void compact_verlet_candidate_cache(
                 GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_shifts_alt));
                 extras.verlet_radix_shifts_alt = nullptr;
             }
-            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_pairs_alt,
-                                           sizeof(uint32_t) * alt_cap * 2));
-            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_shifts_alt,
-                                           sizeof(int32_t) * alt_cap));
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_pairs_alt, sizeof(uint32_t) * alt_cap * 2));
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_shifts_alt, sizeof(int32_t) * alt_cap));
             extras.verlet_radix_alt_capacity = alt_cap;
         }
         if (extras.verlet_radix_histogram == nullptr) {
-            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_histogram,
-                                           sizeof(int32_t) * VESIN_RADIX_BUCKETS));
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_histogram, sizeof(int32_t) * VESIN_RADIX_BUCKETS));
         }
         if (extras.verlet_radix_cursor == nullptr) {
-            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_cursor,
-                                           sizeof(int32_t) * VESIN_RADIX_BUCKETS));
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_cursor, sizeof(int32_t) * VESIN_RADIX_BUCKETS));
         }
 
         auto* zero_kernel = factory.create(
@@ -885,18 +890,14 @@ static void compact_verlet_candidate_cache(
         // location.
         if (src_pairs != d_compact_pairs) {
             GPULITE_CUDART_CALL(cudaMemcpy(
-                d_compact_pairs, src_pairs,
-                sizeof(uint32_t) * candidate_length * 2,
-                cudaMemcpyDeviceToDevice
+                d_compact_pairs, src_pairs, sizeof(uint32_t) * candidate_length * 2, cudaMemcpyDeviceToDevice
             ));
             GPULITE_CUDART_CALL(cudaMemcpy(
-                d_compact_shifts, src_shifts,
-                sizeof(int32_t) * candidate_length,
-                cudaMemcpyDeviceToDevice
+                d_compact_shifts, src_shifts, sizeof(int32_t) * candidate_length, cudaMemcpyDeviceToDevice
             ));
         }
     }
-#else // !VESIN_USE_RADIX_SORT -> bitonic default
+#else  // !VESIN_USE_RADIX_SORT -> bitonic default
     if (candidate_length > 1) {
         size_t sort_capacity = next_power_of_two(candidate_length);
         // ensure_verlet_compact_buffers already over-allocates to
@@ -943,8 +944,7 @@ static void compact_verlet_candidate_cache(
                     static_cast<void*>(&k),
                 };
                 sort_kernel->launch(
-                    dim3(sort_blocks), dim3(sort_threads), 0, nullptr,
-                    step_args, false
+                    dim3(sort_blocks), dim3(sort_threads), 0, nullptr, step_args, false
                 );
             }
         }
@@ -954,7 +954,7 @@ static void compact_verlet_candidate_cache(
 
     extras.verlet_has_compact_candidates = true;
     if (extras.verlet_candidates.device.type == VesinCUDA) {
-        free_neighbors(extras.verlet_candidates);
+        vesin::cuda::free_neighbors(extras.verlet_candidates);
         extras.verlet_candidates = VesinNeighborList();
     }
 }
@@ -1037,7 +1037,7 @@ static void rebuild_verlet_cache(
     const bool h_periodic[3]
 ) {
     if (extras.verlet_candidates.device.type == VesinCUDA) {
-        free_neighbors(extras.verlet_candidates);
+        vesin::cuda::free_neighbors(extras.verlet_candidates);
     }
 
     extras.verlet_candidates = VesinNeighborList();

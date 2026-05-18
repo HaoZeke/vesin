@@ -155,8 +155,7 @@ __global__ void radix_histogram(
     __syncthreads();
 
     if (threadIdx.x < VESIN_RADIX_BUCKETS && local[threadIdx.x] != 0) {
-        atomicAdd(&histogram[threadIdx.x],
-                  static_cast<int>(local[threadIdx.x]));
+        atomicAdd(&histogram[threadIdx.x], static_cast<int>(local[threadIdx.x]));
     }
 }
 

@@ -75,15 +75,15 @@ struct CudaNeighborListExtras {
     // Verlet cache state. Candidates are generated at cutoff + skin and
     // filtered at the exact cutoff while the reference positions remain valid.
     VesinNeighborList verlet_candidates;
-    uint32_t* verlet_compact_candidate_pairs = nullptr;  // [candidate_length * 2]
-    int32_t* verlet_compact_candidate_shifts = nullptr;  // [candidate_length] packed signed 10-bit shifts
-    int32_t* verlet_compact_overflow_flag = nullptr;     // [1]
+    uint32_t* verlet_compact_candidate_pairs = nullptr; // [candidate_length * 2]
+    int32_t* verlet_compact_candidate_shifts = nullptr; // [candidate_length] packed signed 10-bit shifts
+    int32_t* verlet_compact_overflow_flag = nullptr;    // [1]
     // Ping-pong buffers + histogram/cursor for the in-place radix sort
     // of the compact candidate cache. Allocated lazily by the sort path.
-    uint32_t* verlet_radix_pairs_alt = nullptr;          // [verlet_radix_alt_capacity * 2]
-    int32_t* verlet_radix_shifts_alt = nullptr;          // [verlet_radix_alt_capacity]
-    int32_t* verlet_radix_histogram = nullptr;           // [256]
-    int32_t* verlet_radix_cursor = nullptr;              // [256]
+    uint32_t* verlet_radix_pairs_alt = nullptr; // [verlet_radix_alt_capacity * 2]
+    int32_t* verlet_radix_shifts_alt = nullptr; // [verlet_radix_alt_capacity]
+    int32_t* verlet_radix_histogram = nullptr;  // [256]
+    int32_t* verlet_radix_cursor = nullptr;     // [256]
     size_t verlet_radix_alt_capacity = 0;
     size_t verlet_candidate_length = 0;
     size_t verlet_compact_candidate_capacity = 0;
