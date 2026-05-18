@@ -55,6 +55,21 @@ static constexpr size_t DEFAULT_MAX_CELLS = 8192;
 static constexpr size_t MIN_PARTICLES_PER_CELL = 8;
 static constexpr size_t CUDA_VERLET_COMPACT_MIN_POINTS = 1024;  // lowered so the efficient block-compact + sorted path is used even in medium-size profiling runs (real hotspot data)
 
+// Radix-sort algorithm constants. NOT device properties -- these come
+// from the choice to use an 8-bit radix on uint32 candidate keys.
+// Must agree with VESIN_RADIX_BITS in cuda_verlet.cu.
+static constexpr int VESIN_RADIX_BITS = 8;
+static constexpr int VESIN_RADIX_BUCKETS = 1 << VESIN_RADIX_BITS;
+static constexpr int VESIN_RADIX_PASSES = 32 / VESIN_RADIX_BITS;
+
+// Default kernel block size used by the bitonic-sort + radix-sort
+// launches in compact_verlet_candidate_cache. A device-aware version
+// would query gpulite for warp size and pick warp_size * 8; the value
+// below assumes a 32-thread warp and 8 warps/block, which is the
+// configuration every CC >= 6.0 GPU supports. perf-decisions.org has
+// the deferred plan for the device-query refactor.
+static constexpr size_t VESIN_DEFAULT_BLOCK_SIZE = 256;
+
 static std::optional<cudaPointerAttributes> get_ptr_attributes(const void* ptr) {
     if (ptr == nullptr) {
         return std::nullopt;
@@ -172,10 +187,19 @@ static void free_verlet_compact_buffers(CudaNeighborListExtras& extras) {
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_candidate_pairs));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_candidate_shifts));
     GPULITE_CUDART_CALL(cudaFree(extras.verlet_compact_overflow_flag));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_pairs_alt));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_shifts_alt));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_histogram));
+    GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_cursor));
 
     extras.verlet_compact_candidate_pairs = nullptr;
     extras.verlet_compact_candidate_shifts = nullptr;
     extras.verlet_compact_overflow_flag = nullptr;
+    extras.verlet_radix_pairs_alt = nullptr;
+    extras.verlet_radix_shifts_alt = nullptr;
+    extras.verlet_radix_histogram = nullptr;
+    extras.verlet_radix_cursor = nullptr;
+    extras.verlet_radix_alt_capacity = 0;
     extras.verlet_candidate_length = 0;
     extras.verlet_compact_candidate_capacity = 0;
     extras.verlet_has_compact_candidates = false;
@@ -576,13 +600,15 @@ static void ensure_verlet_ref_buffers(CudaNeighborListExtras& extras, size_t n_p
 }
 
 static void ensure_verlet_compact_buffers(CudaNeighborListExtras& extras, size_t candidate_length) {
-    auto capacity = std::max(candidate_length, static_cast<size_t>(1));
-    if (extras.verlet_compact_candidate_capacity < capacity) {
+    // Bitonic sort needs the buffer padded out to the next power of two so
+    // every compare-exchange has a valid partner index. Allocate up front.
+    auto needed = std::max(next_power_of_two(candidate_length), static_cast<size_t>(1));
+    if (extras.verlet_compact_candidate_capacity < needed) {
         free_verlet_compact_buffers(extras);
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_pairs, sizeof(uint32_t) * capacity * 2));
-        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_shifts, sizeof(int32_t) * capacity));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_pairs, sizeof(uint32_t) * needed * 2));
+        GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_candidate_shifts, sizeof(int32_t) * needed));
         GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_compact_overflow_flag, sizeof(int32_t)));
-        extras.verlet_compact_candidate_capacity = capacity;
+        extras.verlet_compact_candidate_capacity = needed;
     }
 
     if (extras.verlet_compact_overflow_flag == nullptr) {
@@ -653,35 +679,231 @@ static void compact_verlet_candidate_cache(
         return;
     }
 
-    // Algorithmic optimization: sort the compact Verlet candidates by the first particle index (i).
-    // This gives the subsequent filter kernel (filter_verlet_*) much better temporal locality
-    // on the random gathers from the positions array, dramatically improving cache hit rate
-    // and "active threads per warp" in the hot filter path. This is the real hotspot
-    // identified by ncu on non-trivial candidate lists.
-    {
-        std::vector<uint32_t> h_pairs(candidate_length * 2);
-        std::vector<int32_t> h_shifts(candidate_length);
-        GPULITE_CUDART_CALL(cudaMemcpy(h_pairs.data(), d_compact_pairs, sizeof(uint32_t) * candidate_length * 2, cudaMemcpyDeviceToHost));
-        GPULITE_CUDART_CALL(cudaMemcpy(h_shifts.data(), d_compact_shifts, sizeof(int32_t) * candidate_length, cudaMemcpyDeviceToHost));
-
-        std::vector<size_t> order(candidate_length);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            return h_pairs[a * 2] < h_pairs[b * 2];
-        });
-
-        std::vector<uint32_t> sorted_pairs(candidate_length * 2);
-        std::vector<int32_t> sorted_shifts(candidate_length);
-        for (size_t k = 0; k < candidate_length; ++k) {
-            size_t src = order[k];
-            sorted_pairs[k * 2 + 0] = h_pairs[src * 2 + 0];
-            sorted_pairs[k * 2 + 1] = h_pairs[src * 2 + 1];
-            sorted_shifts[k] = h_shifts[src];
+    // Sort the compact Verlet candidates by the first particle index (i) so
+    // the subsequent filter kernel gets good temporal locality on positions
+    // gathers and the ri-reuse hits in
+    // filter_verlet_compact_candidates_block actually fire. The earlier
+    // host-side std::sort with two cudaMemcpy round trips regressed rebuild
+    // ~10x at N=32k (see vissue vesin-3okr); replace with an in-place
+    // bitonic sort that runs entirely on device.
+    //
+    // Compile-time toggle for profiling: pass -DVESIN_DISABLE_COMPACT_SORT
+    // to skip the sort entirely. Empirically (see vissue vesin-3okr data)
+    // disabling the sort keeps reuse perf within ~5% while saving the sort
+    // launch chain on rebuild, but the gpu sort is also cheap enough that
+    // the default keeps it on.
+#ifndef VESIN_DISABLE_COMPACT_SORT
+    // Two implementations live in this file. The bitonic chain ships as
+    // default after the May 2026 head-to-head bench on rg.cosmolab
+    // (Software/Metatomic/vesin_bench_plots/perf-decisions.org):
+    // both produce equivalent sort quality for the downstream filter,
+    // and the bitonic launches are individually small enough that the
+    // ~1880-launch count is not the bottleneck it looks like in ncu --
+    // the radix sort's extra cudaMemset sync points + DtoD copy on
+    // odd-parity passes eat the launch-count savings on wall clock.
+    // Define VESIN_USE_RADIX_SORT to switch back to the radix path for
+    // experiments.
+#ifdef VESIN_USE_RADIX_SORT
+    if (candidate_length > 1) {
+        // 4-pass 8-bit radix sort. Replaces the previous bitonic sort
+        // chain (~1880 launches / rebuild at N=8192) with 12 launches
+        // (3 per pass x 4 passes). Sort is NOT stable; the downstream
+        // filter only requires i-grouping for ri reuse, not a specific
+        // order among pairs sharing an i.
+        //
+        // The ping-pong alt buffer must be at least as big as the compact
+        // buffer (verlet_compact_candidate_capacity). If a previous call
+        // sized it smaller (because candidate_length grew on this system
+        // or after a system-size change), reallocate.
+        size_t alt_cap = extras.verlet_compact_candidate_capacity;
+        if (extras.verlet_radix_pairs_alt == nullptr ||
+            extras.verlet_radix_alt_capacity < alt_cap) {
+            if (extras.verlet_radix_pairs_alt != nullptr) {
+                GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_pairs_alt));
+                extras.verlet_radix_pairs_alt = nullptr;
+            }
+            if (extras.verlet_radix_shifts_alt != nullptr) {
+                GPULITE_CUDART_CALL(cudaFree(extras.verlet_radix_shifts_alt));
+                extras.verlet_radix_shifts_alt = nullptr;
+            }
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_pairs_alt,
+                                           sizeof(uint32_t) * alt_cap * 2));
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_shifts_alt,
+                                           sizeof(int32_t) * alt_cap));
+            extras.verlet_radix_alt_capacity = alt_cap;
+        }
+        if (extras.verlet_radix_histogram == nullptr) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_histogram,
+                                           sizeof(int32_t) * VESIN_RADIX_BUCKETS));
+        }
+        if (extras.verlet_radix_cursor == nullptr) {
+            GPULITE_CUDART_CALL(cudaMalloc((void**)&extras.verlet_radix_cursor,
+                                           sizeof(int32_t) * VESIN_RADIX_BUCKETS));
         }
 
-        GPULITE_CUDART_CALL(cudaMemcpy(d_compact_pairs, sorted_pairs.data(), sizeof(uint32_t) * candidate_length * 2, cudaMemcpyHostToDevice));
-        GPULITE_CUDART_CALL(cudaMemcpy(d_compact_shifts, sorted_shifts.data(), sizeof(int32_t) * candidate_length, cudaMemcpyHostToDevice));
+        auto* zero_kernel = factory.create(
+            "zero_radix_buffers",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        auto* hist_kernel = factory.create(
+            "radix_histogram",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        auto* prefix_kernel = factory.create(
+            "radix_prefix_sum_buckets",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+        auto* scatter_kernel = factory.create(
+            "radix_scatter",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        const size_t threads = VESIN_DEFAULT_BLOCK_SIZE;
+        const size_t blocks = std::max(
+            (candidate_length + threads - 1) / threads,
+            static_cast<size_t>(1)
+        );
+
+        uint32_t* src_pairs = d_compact_pairs;
+        int32_t* src_shifts = d_compact_shifts;
+        uint32_t* dst_pairs = extras.verlet_radix_pairs_alt;
+        int32_t* dst_shifts = extras.verlet_radix_shifts_alt;
+        int32_t* d_histogram = extras.verlet_radix_histogram;
+        int32_t* d_cursor = extras.verlet_radix_cursor;
+
+        for (unsigned int pass = 0; pass < VESIN_RADIX_PASSES; ++pass) {
+            unsigned int shift_bits = pass * VESIN_RADIX_BITS;
+
+            // One zero-kernel launch instead of two sync cudaMemset(0)
+            // calls per pass (saves ~40 us of sync-point latency per
+            // rebuild across all VESIN_RADIX_PASSES). Single block of
+            // VESIN_RADIX_BUCKETS threads clears both buckets arrays.
+            std::vector<void*> zero_args = {
+                static_cast<void*>(&d_histogram),
+                static_cast<void*>(&d_cursor),
+            };
+            zero_kernel->launch(
+                dim3(1), dim3(VESIN_RADIX_BUCKETS), 0, nullptr, zero_args, false
+            );
+
+            std::vector<void*> hist_args = {
+                static_cast<void*>(&src_pairs),
+                static_cast<void*>(&candidate_length),
+                static_cast<void*>(&shift_bits),
+                static_cast<void*>(&d_histogram),
+            };
+            hist_kernel->launch(
+                dim3(blocks), dim3(threads), 0, nullptr, hist_args, false
+            );
+
+            std::vector<void*> prefix_args = {
+                static_cast<void*>(&d_histogram),
+            };
+            prefix_kernel->launch(
+                dim3(1), dim3(VESIN_RADIX_BUCKETS), 0, nullptr, prefix_args, false
+            );
+
+            std::vector<void*> scatter_args = {
+                static_cast<void*>(&src_pairs),
+                static_cast<void*>(&src_shifts),
+                static_cast<void*>(&dst_pairs),
+                static_cast<void*>(&dst_shifts),
+                static_cast<void*>(&candidate_length),
+                static_cast<void*>(&shift_bits),
+                static_cast<void*>(&d_histogram),
+                static_cast<void*>(&d_cursor),
+            };
+            scatter_kernel->launch(
+                dim3(blocks), dim3(threads), 0, nullptr, scatter_args, false
+            );
+
+            // Ping-pong: next pass reads from the just-written dst.
+            std::swap(src_pairs, dst_pairs);
+            std::swap(src_shifts, dst_shifts);
+        }
+
+        // After 4 passes the final sorted result is in src_pairs / src_shifts
+        // (the buffers were swapped after each pass, so what was the source
+        // of the LAST pass now holds the output of the LAST pass after the
+        // swap). If that is not the original d_compact_pairs, copy the
+        // sorted data back so the filter kernel reads from the expected
+        // location.
+        if (src_pairs != d_compact_pairs) {
+            GPULITE_CUDART_CALL(cudaMemcpy(
+                d_compact_pairs, src_pairs,
+                sizeof(uint32_t) * candidate_length * 2,
+                cudaMemcpyDeviceToDevice
+            ));
+            GPULITE_CUDART_CALL(cudaMemcpy(
+                d_compact_shifts, src_shifts,
+                sizeof(int32_t) * candidate_length,
+                cudaMemcpyDeviceToDevice
+            ));
+        }
     }
+#else // !VESIN_USE_RADIX_SORT -> bitonic default
+    if (candidate_length > 1) {
+        size_t sort_capacity = next_power_of_two(candidate_length);
+        // ensure_verlet_compact_buffers already over-allocates to
+        // next_power_of_two so the pad+sort can write past
+        // candidate_length safely.
+
+        auto* pad_kernel = factory.create(
+            "pad_compact_candidates",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        auto* sort_kernel = factory.create(
+            "sort_compact_candidates_bitonic_step",
+            cuda_verlet_code,
+            "cuda_verlet.cu",
+            {"-std=c++17", "-default-device"}
+        );
+
+        const size_t sort_threads = VESIN_DEFAULT_BLOCK_SIZE;
+        const size_t sort_blocks = std::max(
+            (sort_capacity + sort_threads - 1) / sort_threads,
+            static_cast<size_t>(1)
+        );
+
+        std::vector<void*> pad_args = {
+            static_cast<void*>(&d_compact_pairs),
+            static_cast<void*>(&d_compact_shifts),
+            static_cast<void*>(&candidate_length),
+            static_cast<void*>(&sort_capacity),
+        };
+        pad_kernel->launch(
+            dim3(sort_blocks), dim3(sort_threads), 0, nullptr, pad_args, false
+        );
+
+        for (size_t k = 2; k <= sort_capacity; k <<= 1) {
+            for (size_t j = k >> 1; j > 0; j >>= 1) {
+                std::vector<void*> step_args = {
+                    static_cast<void*>(&d_compact_pairs),
+                    static_cast<void*>(&d_compact_shifts),
+                    static_cast<void*>(&sort_capacity),
+                    static_cast<void*>(&j),
+                    static_cast<void*>(&k),
+                };
+                sort_kernel->launch(
+                    dim3(sort_blocks), dim3(sort_threads), 0, nullptr,
+                    step_args, false
+                );
+            }
+        }
+    }
+#endif // VESIN_USE_RADIX_SORT
+#endif // VESIN_DISABLE_COMPACT_SORT
 
     extras.verlet_has_compact_candidates = true;
     if (extras.verlet_candidates.device.type == VesinCUDA) {
@@ -720,6 +942,15 @@ static bool verlet_needs_rebuild(
         {"-std=c++17", "-default-device"}
     );
 
+    // check_verlet_displacements fires on every reuse call. ncu showed
+    // it at ~14% achieved occupancy with threads=256 (grid size 32 at
+    // N=8192) -- too few blocks to cover all 66 SMs on the RTX 4070 Ti
+    // SUPER. Dropping threads to 64 quadrupled the grid but achieved
+    // occupancy actually fell to ~7% (the kernel is hardware-limited at
+    // 24 blocks/SM x 2 warps = 48 warps/SM, so the SMs that DO get
+    // blocks are already saturated and the new blocks don't help).
+    // Kernel duration is 3 us either way -- not worth optimising
+    // further at this size. Keeping the original 256.
     size_t threads = 256;
     size_t blocks = (n_points + threads - 1) / threads;
     auto* d_ref_positions = extras.verlet_ref_positions;

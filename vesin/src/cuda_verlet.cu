@@ -1,3 +1,14 @@
+// Algorithm-inherent radix sort constants. NOT device properties --
+// these come from the choice to use an 8-bit radix on 32-bit keys
+// (uint32 candidate first-particle index). The host launch grid and
+// the kernels' shared-memory arrays both have to agree on
+// VESIN_RADIX_BUCKETS. If you change VESIN_RADIX_BITS, mirror the
+// change in the host code (radix_passes loop bound + sort-time
+// shift mask).
+#define VESIN_RADIX_BITS 8
+#define VESIN_RADIX_BUCKETS (1 << VESIN_RADIX_BITS)
+#define VESIN_RADIX_PASSES (32 / VESIN_RADIX_BITS)
+
 __device__ inline size_t atomicAdd_size_t(size_t* address, size_t val) {
     unsigned long long* address_as_ull = reinterpret_cast<unsigned long long*>(address);
     return static_cast<size_t>(atomicAdd(address_as_ull, static_cast<unsigned long long>(val)));
@@ -28,6 +39,189 @@ __global__ void check_verlet_displacements(
 __device__ inline int unpack_verlet_shift(int packed, int offset) {
     int value = (packed >> offset) & 1023;
     return value >= 512 ? value - 1024 : value;
+}
+
+// Bitonic compare-exchange step that sorts the compact candidate cache in
+// place by the first particle index (pairs[2*idx]). The sort is launched
+// log2(next_pow2(candidate_length))^2 / 2 times by the host code.
+//
+// Pre-condition: pairs+shifts are padded out to next_power_of_two with a
+// sentinel where the first key is UINT_MAX (handled by the host before the
+// first step). pad_compact_candidates below installs that sentinel.
+__global__ void sort_compact_candidates_bitonic_step(
+    unsigned int* __restrict__ pairs,
+    int* __restrict__ shifts,
+    size_t sort_capacity,
+    size_t j,
+    size_t k
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= sort_capacity) {
+        return;
+    }
+
+    size_t ixj = idx ^ j;
+    if (ixj <= idx || ixj >= sort_capacity) {
+        return;
+    }
+
+    bool ascending = ((idx & k) == 0);
+    unsigned int ai = pairs[idx * 2 + 0];
+    unsigned int bi = pairs[ixj * 2 + 0];
+    bool idx_less = ai < bi;
+    bool should_swap = ascending ? !idx_less : idx_less;
+
+    if (should_swap) {
+        unsigned int a0 = pairs[idx * 2 + 0];
+        unsigned int a1 = pairs[idx * 2 + 1];
+        pairs[idx * 2 + 0] = pairs[ixj * 2 + 0];
+        pairs[idx * 2 + 1] = pairs[ixj * 2 + 1];
+        pairs[ixj * 2 + 0] = a0;
+        pairs[ixj * 2 + 1] = a1;
+        int sa = shifts[idx];
+        shifts[idx] = shifts[ixj];
+        shifts[ixj] = sa;
+    }
+}
+
+// Pad the compact candidate cache from `length` up to `capacity` with a
+// sentinel that sorts to the end of the bitonic sequence (pair[0] = UINT_MAX).
+// The shift value of the padding entries is irrelevant because the host
+// truncates back to `length` after the sort.
+__global__ void pad_compact_candidates(
+    unsigned int* __restrict__ pairs,
+    int* __restrict__ shifts,
+    size_t length,
+    size_t capacity
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < length || idx >= capacity) {
+        return;
+    }
+    pairs[idx * 2 + 0] = 0xFFFFFFFFu;
+    pairs[idx * 2 + 1] = 0xFFFFFFFFu;
+    shifts[idx] = 0;
+}
+
+// 4-pass 8-bit radix sort kernels for the compact candidate cache. The
+// bitonic sort above takes O(log^2 N) kernel launches and was dominated
+// by kernel launch overhead on small partner distances; ncu showed
+// ~1880 bitonic launches per rebuild at N=8192. Radix needs 3 kernel
+// launches per pass, so 4 passes -> 12 launches total. The sort is NOT
+// stable but the downstream filter only requires i-grouping for ri
+// reuse, not a specific ordering among pairs that share an i.
+
+// One-launch zero kernel for the radix histogram + cursor buffers
+// (256 ints each). Replaces two sync cudaMemset(0) calls per pass
+// (and 8 across 4 passes per rebuild). Single block of 256 threads
+// stores both arrays in one go.
+__global__ void zero_radix_buffers(
+    int* __restrict__ histogram,
+    int* __restrict__ cursor
+) {
+    if (blockIdx.x != 0) {
+        return;
+    }
+    int tid = threadIdx.x;
+    if (tid < VESIN_RADIX_BUCKETS) {
+        histogram[tid] = 0;
+        cursor[tid] = 0;
+    }
+}
+
+// Pass 1/3 per radix pass: count how many entries fall in each of 256
+// buckets for the current 8-bit slice. Block-local shared histogram is
+// reduced into a global 256-bucket histogram via atomicAdd.
+__global__ void radix_histogram(
+    const unsigned int* __restrict__ pairs,
+    size_t length,
+    unsigned int shift_bits,
+    int* __restrict__ histogram
+) {
+    __shared__ unsigned int local[VESIN_RADIX_BUCKETS];
+    if (threadIdx.x < VESIN_RADIX_BUCKETS) {
+        local[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    const unsigned int bucket_mask = VESIN_RADIX_BUCKETS - 1u;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < length;
+         idx += blockDim.x * gridDim.x) {
+        unsigned int key = pairs[idx * 2 + 0];
+        unsigned int bucket = (key >> shift_bits) & bucket_mask;
+        atomicAdd(&local[bucket], 1u);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < VESIN_RADIX_BUCKETS && local[threadIdx.x] != 0) {
+        atomicAdd(&histogram[threadIdx.x],
+                  static_cast<int>(local[threadIdx.x]));
+    }
+}
+
+// Pass 2/3 per radix pass: exclusive prefix sum on the 256-bucket
+// histogram (a single CUDA block of 256 threads is enough). Writes the
+// exclusive prefix in place so the scatter pass sees bucket-start
+// offsets.
+__global__ void radix_prefix_sum_buckets(int* __restrict__ histogram) {
+    if (blockIdx.x != 0) {
+        return; // single-block kernel
+    }
+    __shared__ int s[VESIN_RADIX_BUCKETS];
+    int tid = threadIdx.x;
+    if (tid < VESIN_RADIX_BUCKETS) {
+        s[tid] = histogram[tid];
+    }
+    __syncthreads();
+
+    // Hillis-Steele inclusive scan.
+    for (int off = 1; off < VESIN_RADIX_BUCKETS; off <<= 1) {
+        int v = 0;
+        if (tid >= off && tid < VESIN_RADIX_BUCKETS) {
+            v = s[tid - off];
+        }
+        __syncthreads();
+        if (tid < VESIN_RADIX_BUCKETS) {
+            s[tid] += v;
+        }
+        __syncthreads();
+    }
+    if (tid < VESIN_RADIX_BUCKETS) {
+        int exclusive = (tid == 0) ? 0 : s[tid - 1];
+        histogram[tid] = exclusive;
+    }
+}
+
+// Pass 3/3 per radix pass: each thread reads its (key, payload) tuple,
+// extracts the 8-bit slice, atomicAdds to a per-bucket cursor to claim
+// its output slot, and writes to the output buffers at
+// (prefix[bucket] + slot). The bucket_cursor buffer must be cleared to
+// 0 by the host before each pass.
+__global__ void radix_scatter(
+    const unsigned int* __restrict__ in_pairs,
+    const int* __restrict__ in_shifts,
+    unsigned int* __restrict__ out_pairs,
+    int* __restrict__ out_shifts,
+    size_t length,
+    unsigned int shift_bits,
+    const int* __restrict__ prefix,
+    int* __restrict__ bucket_cursor
+) {
+    const unsigned int bucket_mask = VESIN_RADIX_BUCKETS - 1u;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < length;
+         idx += blockDim.x * gridDim.x) {
+        unsigned int p0 = in_pairs[idx * 2 + 0];
+        unsigned int p1 = in_pairs[idx * 2 + 1];
+        int ps = in_shifts[idx];
+        unsigned int bucket = (p0 >> shift_bits) & bucket_mask;
+        int slot = atomicAdd(&bucket_cursor[bucket], 1);
+        int dst = prefix[bucket] + slot;
+        out_pairs[dst * 2 + 0] = p0;
+        out_pairs[dst * 2 + 1] = p1;
+        out_shifts[dst] = ps;
+    }
 }
 
 __global__ void pack_verlet_candidates(
@@ -133,6 +327,15 @@ __global__ void filter_verlet_compact_candidates(
     }
 }
 
+// __launch_bounds__ deliberately omitted: ncu showed the (256, 8)
+// variant trimmed regs/thread 54 -> 48 and lifted theoretical
+// occupancy 66.67% -> 83.33%, but kernel duration stayed at 23.7 us
+// (same as unconstrained) because the kernel is compute-bound at
+// ~64% SM throughput, not memory-latency-bound. The right device-
+// derived bound would come from querying gpulite
+// (cuDeviceGetAttribute MAX_THREADS_PER_MULTIPROCESSOR /
+// MAX_REGISTERS_PER_MULTIPROCESSOR) and passing the result as an
+// NVRTC compile flag; see perf-decisions.org for the deferred plan.
 __global__ void filter_verlet_compact_candidates_block(
     const double* __restrict__ positions,
     const double* __restrict__ box,
