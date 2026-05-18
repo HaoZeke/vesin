@@ -1,10 +1,11 @@
 """Tests for Verlet caching with CUDA arrays."""
 
-import cupy as cp
 import pytest
 
 from vesin import NeighborList
 
+
+cp = pytest.importorskip("cupy")
 
 try:
     cp.cuda.Device(0).compute_capability
