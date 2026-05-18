@@ -367,37 +367,67 @@ __global__ void filter_verlet_compact_candidates_block(
     __shared__ size_t block_base;
     const int warp_count_slots = (blockDim.x + 31) / 32;
 
+    // Round trip count up to a uniform block stride so every thread in the
+    // block reaches each __syncthreads() the same number of times. The
+    // previous form (`idx < candidate_length` on the for header) let
+    // high-idx threads exit the loop early; their block-mates with idx <
+    // candidate_length then hit __syncthreads() alone, which is UB and
+    // empirically corrupted the warp-prefix-sum / block_base counters
+    // enough to over-reserve slots in *length and trip the overflow flag
+    // at large N with long benchmark runs. Threads with invalid_idx still
+    // iterate but with keep=false, so they contribute zero to the warp
+    // ballot and never write output.
+    const size_t block_stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    const size_t total = ((candidate_length + block_stride - 1) / block_stride) * block_stride;
+
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < candidate_length;
-         idx += blockDim.x * gridDim.x) {
+         idx < total;
+         idx += block_stride) {
 
-        size_t i = static_cast<size_t>(candidate_pairs[idx * 2 + 0]);
-        size_t j = static_cast<size_t>(candidate_pairs[idx * 2 + 1]);
+        bool valid = idx < candidate_length;
 
-        int packed_shift = candidate_shifts[idx];
-        int sx = unpack_verlet_shift(packed_shift, 0);
-        int sy = unpack_verlet_shift(packed_shift, 10);
-        int sz = unpack_verlet_shift(packed_shift, 20);
+        size_t i = 0;
+        size_t j = 0;
+        int sx = 0;
+        int sy = 0;
+        int sz = 0;
+        double vx = 0.0;
+        double vy = 0.0;
+        double vz = 0.0;
+        double dist_sq = 0.0;
+        bool keep = false;
 
-        if (i != prev_i) {
-            ri = &positions[i * 3];
-            prev_i = i;
+        if (valid) {
+            i = static_cast<size_t>(candidate_pairs[idx * 2 + 0]);
+            j = static_cast<size_t>(candidate_pairs[idx * 2 + 1]);
+
+            int packed_shift = candidate_shifts[idx];
+            sx = unpack_verlet_shift(packed_shift, 0);
+            sy = unpack_verlet_shift(packed_shift, 10);
+            sz = unpack_verlet_shift(packed_shift, 20);
+
+            if (i != prev_i) {
+                ri = &positions[i * 3];
+                prev_i = i;
+            }
+            const double* rj = &positions[j * 3];
+
+            vx = rj[0] - ri[0];
+            vy = rj[1] - ri[1];
+            vz = rj[2] - ri[2];
+            if (sx != 0 || sy != 0 || sz != 0) {
+                vx += sx * box[0] + sy * box[3] + sz * box[6];
+                vy += sx * box[1] + sy * box[4] + sz * box[7];
+                vz += sx * box[2] + sy * box[5] + sz * box[8];
+            }
+            dist_sq = vx * vx + vy * vy + vz * vz;
+            keep = dist_sq < cutoff2;
         }
-        const double* rj = &positions[j * 3];
 
-        double vx = rj[0] - ri[0];
-        double vy = rj[1] - ri[1];
-        double vz = rj[2] - ri[2];
-        if (sx != 0 || sy != 0 || sz != 0) {
-            vx += sx * box[0] + sy * box[3] + sz * box[6];
-            vy += sx * box[1] + sy * box[4] + sz * box[7];
-            vz += sx * box[2] + sy * box[5] + sz * box[8];
-        }
-        double dist_sq = vx * vx + vy * vy + vz * vz;
-
-        bool keep = dist_sq < cutoff2;
-        unsigned active_mask = __activemask();
-        unsigned passing_mask = __ballot_sync(active_mask, keep);
+        // Full block participates in the ballot so the warp-prefix-sum
+        // sees a consistent active mask across iterations. Invalid threads
+        // contribute keep=false and so do not skew counts.
+        unsigned passing_mask = __ballot_sync(0xFFFFFFFFu, keep);
         int lane = threadIdx.x & 31;
         int warp = threadIdx.x >> 5;
         int lane_rank = __popc(passing_mask & ((1u << lane) - 1u));
