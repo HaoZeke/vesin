@@ -1246,7 +1246,15 @@ static void recompute_verlet_neighbors(
     ));
 
     if (h_overflow_flag != 0) {
-        throw std::runtime_error("The CUDA Verlet output exceeds the cached candidate capacity");
+        throw std::runtime_error(
+            "The CUDA Verlet recompute wrote more pairs than the cached candidate "
+            "buffer. This usually means atoms have drifted by more than skin/2 since "
+            "the last rebuild and a fresh stateless call is needed; pass skin=0 to "
+            "force the stateless path, increase skin so the buffer covers more "
+            "displacement, or call NeighborList again with a fresh handle. Note: "
+            "VESIN_CUDA_MAX_PAIRS_PER_POINT only sizes the stateless allocation and "
+            "does not affect the Verlet recompute capacity."
+        );
     }
 
     neighbors.length = *extras.pinned_length_ptr;
